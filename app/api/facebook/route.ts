@@ -1,65 +1,45 @@
-import { NextResponse } from 'next/server';
+import { NextResponse } from "next/server";
 
-// CẤU HÌNH THÔNG TIN FACEBOOK CỦA BẠN (Nên cấu hình trong file .env.local)
-const ACCESS_TOKEN = process.env.FB_ACCESS_TOKEN || "THAY_BANG_ACCESS_TOKEN_CUA_BAN";
-const AD_ACCOUNT_ID = process.env.FB_AD_ACCOUNT_ID || "act_THAY_BANG_ID_TAI_KHOAN_QC"; 
-const VERSION = "v19.0";
+import { createAudience, getClientSafeError } from "@/app/api/audiences/meta";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   try {
-    const { hashedEmails, audienceName } = await request.json();
-
-    if (!hashedEmails || hashedEmails.length === 0) {
-      return NextResponse.json({ error: 'Danh sách email trống' }, { status: 400 });
-    }
-
-    // --- BƯỚC 1: Tạo Custom Audience trống ---
-    const createUrl = `https://graph.facebook.com/${VERSION}/${AD_ACCOUNT_ID}/customaudiences`;
-    
-    const createFormData = new URLSearchParams();
-    createFormData.append('name', audienceName || 'API Email List Audience (Demo)');
-    createFormData.append('subtype', 'CUSTOM');
-    createFormData.append('customer_file_source', 'USER_PROVIDED_ONLY');
-    createFormData.append('access_token', ACCESS_TOKEN);
-
-    const createRes = await fetch(createUrl, {
-      method: 'POST',
-      body: createFormData,
-    });
-    const createData = await createRes.json();
-
-    if (createData.error) {
-      return NextResponse.json({ error: `Lỗi tạo Audience: ${createData.error.message}` }, { status: 400 });
-    }
-
-    const audienceId = createData.id;
-
-    // --- BƯỚC 2: Upload dữ liệu Email đã Hash lên Audience vừa tạo ---
-    const uploadUrl = `https://graph.facebook.com/${VERSION}/${audienceId}/users`;
-    
-    const payloadData = {
-      schema: 'EMAIL_SHA256',
-      data: hashedEmails
+    const body = (await request.json()) as {
+      audienceName?: unknown;
+      description?: unknown;
+      hashedEmails?: unknown;
     };
 
-    const uploadFormData = new URLSearchParams();
-    uploadFormData.append('payload', JSON.stringify(payloadData));
-    uploadFormData.append('access_token', ACCESS_TOKEN);
-
-    const uploadRes = await fetch(uploadUrl, {
-      method: 'POST',
-      body: uploadFormData,
+    const result = await createAudience({
+      name:
+        typeof body.audienceName === "string" ? body.audienceName : "Untitled audience",
+      description:
+        typeof body.description === "string" ? body.description : undefined,
+      hashedEmails: body.hashedEmails,
     });
-    const uploadData = await uploadRes.json();
 
     return NextResponse.json({
       success: true,
-      audienceId,
-      numReceived: uploadData.num_received,
-      details: uploadData
+      audienceId: result.audienceId,
+      numReceived: result.uploadedCount,
+      invalidEntryCount: result.invalidEntryCount,
+      sessionId: result.sessionId,
     });
+  } catch (error) {
+    const safeError = getClientSafeError(error, "Không thể tạo audience qua route tương thích cũ.");
 
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message || 'Lỗi server nội bộ' }, { status: 500 });
+    return NextResponse.json(
+      {
+        error: safeError.message,
+        details: safeError.details,
+      },
+      {
+        status: safeError.status,
+      }
+    );
   }
 }
