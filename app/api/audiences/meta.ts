@@ -106,6 +106,26 @@ export function getClientSafeError(
   };
 }
 
+export function isFacebookRateLimitError(error: unknown) {
+  if (!(error instanceof FacebookApiError)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  const code = error.details?.code;
+
+  return (
+    code === 4 ||
+    code === 17 ||
+    code === 32 ||
+    code === 613 ||
+    code === 80003 ||
+    /rate limit|too many calls|application request limit|wait and try again/i.test(
+      message
+    )
+  );
+}
+
 export function validateHashedEmails(input: unknown): string[] {
   if (!Array.isArray(input) || input.length === 0) {
     throw new FacebookApiError(
@@ -164,10 +184,54 @@ export async function createAudience(input: {
   description?: string;
   hashedEmails: unknown;
 }) {
+  const name = input.name.trim();
+  const hashedEmails = validateHashedEmails(input.hashedEmails);
+
+  if (!name) {
+    throw new FacebookApiError("Tên đối tượng là bắt buộc.", 400);
+  }
+  const createdAudience = await createEmptyAudience({
+    name,
+    description: input.description,
+  });
+  const uploadResult = await uploadHashedUsers(createdAudience.id, hashedEmails);
+
+  return {
+    audienceId: createdAudience.id,
+    uploadedCount: uploadResult.num_received ?? hashedEmails.length,
+    invalidEntryCount: uploadResult.num_invalid_entries ?? 0,
+    sessionId: uploadResult.session_id ?? null,
+  };
+}
+
+export async function addUsersToAudience(input: {
+  audienceId: string;
+  hashedEmails: unknown;
+}) {
+  const audienceId = input.audienceId.trim();
+  const hashedEmails = validateHashedEmails(input.hashedEmails);
+
+  if (!audienceId) {
+    throw new FacebookApiError("Audience ID không hợp lệ.", 400);
+  }
+
+  const uploadResult = await uploadHashedUsers(audienceId, hashedEmails);
+
+  return {
+    audienceId,
+    uploadedCount: uploadResult.num_received ?? hashedEmails.length,
+    invalidEntryCount: uploadResult.num_invalid_entries ?? 0,
+    sessionId: uploadResult.session_id ?? null,
+  };
+}
+
+export async function createEmptyAudience(input: {
+  name: string;
+  description?: string;
+}) {
   const { adAccountId } = getFacebookConfig();
   const name = input.name.trim();
   const description = input.description?.trim() ?? "";
-  const hashedEmails = validateHashedEmails(input.hashedEmails);
 
   if (!name) {
     throw new FacebookApiError("Tên đối tượng là bắt buộc.", 400);
@@ -190,35 +254,23 @@ export async function createAudience(input: {
     }
   );
 
-  const uploadResult = await uploadAudienceUsers(createdAudience.id, hashedEmails);
-
   return {
-    audienceId: createdAudience.id,
-    uploadedCount: uploadResult.num_received ?? hashedEmails.length,
-    invalidEntryCount: uploadResult.num_invalid_entries ?? 0,
-    sessionId: uploadResult.session_id ?? null,
+    id: createdAudience.id,
   };
 }
 
-export async function addUsersToAudience(input: {
-  audienceId: string;
-  hashedEmails: unknown;
-}) {
-  const audienceId = input.audienceId.trim();
-  const hashedEmails = validateHashedEmails(input.hashedEmails);
+export async function uploadHashedUsers(
+  audienceId: string,
+  hashedEmails: unknown
+) {
+  const normalizedAudienceId = audienceId.trim();
+  const normalizedHashes = validateHashedEmails(hashedEmails);
 
-  if (!audienceId) {
+  if (!normalizedAudienceId) {
     throw new FacebookApiError("Audience ID không hợp lệ.", 400);
   }
 
-  const uploadResult = await uploadAudienceUsers(audienceId, hashedEmails);
-
-  return {
-    audienceId,
-    uploadedCount: uploadResult.num_received ?? hashedEmails.length,
-    invalidEntryCount: uploadResult.num_invalid_entries ?? 0,
-    sessionId: uploadResult.session_id ?? null,
-  };
+  return uploadAudienceUsers(normalizedAudienceId, normalizedHashes);
 }
 
 export async function deleteAudience(audienceId: string) {

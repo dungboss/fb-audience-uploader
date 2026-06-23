@@ -57,14 +57,20 @@ const DROPZONE_ACCEPT: Accept = {
 };
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const EXPIRING_SOON_DAYS = 150;
+const HASH_BATCH_SIZE = 400;
+const CLIENT_UPLOAD_CHUNK_SIZE = 10_000;
+const JOB_POLL_DELAY_MS = 250;
 const numberFormatter = new Intl.NumberFormat("vi-VN");
-const dateTimeFormatter = new Intl.DateTimeFormat("vi-VN", {
-  dateStyle: "medium",
-  timeStyle: "short",
-});
 
 type AudienceAvailability = "ready" | "populating";
+type AudienceJobKind = "create" | "append";
+type AudienceJobStatus =
+  | "draft"
+  | "uploading"
+  | "queued"
+  | "processing"
+  | "completed"
+  | "failed";
 
 type Audience = {
   id: string;
@@ -77,11 +83,16 @@ type Audience = {
   timeUpdated: string | null;
 };
 
-type UploadSnapshot = {
+type FileSelection = {
+  file: File;
   fileName: string;
-  validEmailCount: number;
+  fileSize: number;
+};
+
+type UploadPipelineSummary = {
+  totalParts: number;
+  uniqueHashCount: number;
   duplicateCount: number;
-  hashedEmails: string[];
 };
 
 type ProgressState = {
@@ -90,16 +101,45 @@ type ProgressState = {
   value: number;
 };
 
+type AudienceUploadJob = {
+  id: string;
+  kind: AudienceJobKind;
+  status: AudienceJobStatus;
+  name: string;
+  description: string;
+  fileName: string;
+  audienceId: string | null;
+  receivedPartCount: number;
+  processedPartCount: number;
+  receivedHashCount: number;
+  syncedHashCount: number;
+  totalParts: number | null;
+  totalHashes: number | null;
+  duplicateCount: number;
+  invalidEntryCount: number;
+  lastSessionId: string | null;
+  errorMessage: string | null;
+  finalizedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type AudienceListResponse = {
   audiences?: Audience[];
   error?: string;
 };
 
-type AudienceMutationResponse = {
-  audienceId: string;
-  uploadedCount: number;
-  invalidEntryCount: number;
-  sessionId: string | null;
+type AudienceJobResponse = {
+  job?: AudienceUploadJob;
+  error?: string;
+};
+
+type UploadPartPresignResponse = {
+  job?: AudienceUploadJob;
+  uploadUrl?: string;
+  objectKey?: string;
+  expiresIn?: number;
   error?: string;
 };
 
@@ -112,9 +152,8 @@ type DeleteAudienceResponse = {
 export default function Home() {
   const [audienceName, setAudienceName] = useState(() => generateAudienceName());
   const [description, setDescription] = useState("");
-  const [createSnapshot, setCreateSnapshot] = useState<UploadSnapshot | null>(null);
+  const [createFile, setCreateFile] = useState<FileSelection | null>(null);
   const [createProgress, setCreateProgress] = useState<ProgressState | null>(null);
-  const [isPreparingCreateFile, setIsPreparingCreateFile] = useState(false);
   const [isCreateSubmitting, setIsCreateSubmitting] = useState(false);
 
   const [audiences, setAudiences] = useState<Audience[]>([]);
@@ -128,9 +167,8 @@ export default function Home() {
 
   const [selectedAudience, setSelectedAudience] = useState<Audience | null>(null);
   const [isAddUsersDialogOpen, setIsAddUsersDialogOpen] = useState(false);
-  const [updateSnapshot, setUpdateSnapshot] = useState<UploadSnapshot | null>(null);
+  const [updateFile, setUpdateFile] = useState<FileSelection | null>(null);
   const [updateProgress, setUpdateProgress] = useState<ProgressState | null>(null);
-  const [isPreparingUpdateFile, setIsPreparingUpdateFile] = useState(false);
   const [isUpdateSubmitting, setIsUpdateSubmitting] = useState(false);
 
   const [deleteTargets, setDeleteTargets] = useState<Audience[]>([]);
@@ -140,12 +178,11 @@ export default function Home() {
   const selectedIdSet = new Set(selectedIds);
   const normalizedSearchQuery = deferredSearchQuery.trim().toLowerCase();
   const filteredAudiences = audiences.filter((audience) => {
-    const matchesSearch =
+    return (
       !normalizedSearchQuery ||
       audience.name.toLowerCase().includes(normalizedSearchQuery) ||
-      audience.id.toLowerCase().includes(normalizedSearchQuery);
-
-    return matchesSearch;
+      audience.id.toLowerCase().includes(normalizedSearchQuery)
+    );
   });
 
   const selectedVisibleCount = filteredAudiences.filter((audience) =>
@@ -157,6 +194,7 @@ export default function Home() {
   const selectedAudiences = audiences.filter((audience) =>
     selectedIdSet.has(audience.id)
   );
+
   function applyAudienceResult(nextAudiences: Audience[]) {
     startTransition(() => {
       setAudiences(nextAudiences);
@@ -176,6 +214,7 @@ export default function Home() {
 
       try {
         const nextAudiences = await fetchAudiencesFromApi();
+
         if (isCancelled) {
           return;
         }
@@ -238,34 +277,26 @@ export default function Home() {
     }
   }
 
-  async function handlePrepareCreateFile(file: File) {
-    setIsPreparingCreateFile(true);
-    setCreateProgress({
-      step: "Đang đọc file...",
-      description: `PapaParse đang quét ${file.name} trực tiếp trên trình duyệt.`,
-      value: 8,
+  async function handleCreateFileSelected(file: File) {
+    setCreateFile({
+      file,
+      fileName: file.name,
+      fileSize: file.size,
     });
+    setCreateProgress(null);
+  }
 
-    try {
-      const snapshot = await prepareUploadSnapshot(file, setCreateProgress);
-      setCreateSnapshot(snapshot);
-      toast.success("File đã sẵn sàng để đồng bộ.", {
-        description: `${formatNumber(snapshot.validEmailCount)} email hợp lệ đã được chuẩn hóa và băm SHA-256.`,
-      });
-      dismissProgressLater(setCreateProgress);
-    } catch (error) {
-      setCreateSnapshot(null);
-      setCreateProgress(null);
-      toast.error("Không thể xử lý file tạo audience.", {
-        description: getErrorMessage(error, "Vui lòng kiểm tra lại file CSV/TXT."),
-      });
-    } finally {
-      setIsPreparingCreateFile(false);
-    }
+  async function handleUpdateFileSelected(file: File) {
+    setUpdateFile({
+      file,
+      fileName: file.name,
+      fileSize: file.size,
+    });
+    setUpdateProgress(null);
   }
 
   async function handleCreateAudience() {
-    if (!createSnapshot) {
+    if (!createFile) {
       toast.error("Hãy chọn file dữ liệu trước khi đồng bộ.");
       return;
     }
@@ -277,65 +308,59 @@ export default function Home() {
 
     setIsCreateSubmitting(true);
     setCreateProgress({
-      step: "Đang khởi tạo đối tượng trên Meta...",
-      description: "Server đang tạo Custom Audience trống bằng Marketing API.",
-      value: 72,
+      step: "Đang khởi tạo job...",
+      description: "Server đang tạo upload job để nhận các shard hash.",
+      value: 4,
     });
 
-    const syncStageTimer = window.setTimeout(() => {
-      setCreateProgress((current) =>
-        current
-          ? {
-              step: "Đang đồng bộ dữ liệu...",
-              description:
-                "Payload EMAIL_SHA256 đang được gửi đến endpoint /users của audience mới.",
-              value: 88,
-            }
-          : current
-      );
-    }, 650);
-
     try {
-      const response = await fetch("/api/audiences", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          name: audienceName.trim(),
-          description: description.trim(),
-          hashedEmails: createSnapshot.hashedEmails,
-        }),
+      const job = await createAudienceJob({
+        kind: "create",
+        name: audienceName.trim(),
+        description: description.trim(),
+        fileName: createFile.fileName,
       });
 
-      const payload = await readJsonSafe<AudienceMutationResponse>(response);
+      const summary = await uploadFileToJob({
+        file: createFile.file,
+        jobId: job.id,
+        setProgress: setCreateProgress,
+      });
 
-      if (!response.ok) {
-        throw new Error(payload.error || "Meta từ chối tạo Custom Audience.");
-      }
+      await finalizeAudienceJob(job.id, summary);
 
-      window.clearTimeout(syncStageTimer);
+      setCreateProgress({
+        step: "Đang xếp hàng xử lý...",
+        description: "Các shard đã ở R2, worker nền sẽ đồng bộ lần lượt lên Meta.",
+        value: 64,
+      });
+
+      const completedJob = await runAudienceJobUntilComplete(
+        job.id,
+        setCreateProgress
+      );
+
       setCreateProgress({
         step: "Đang làm mới dashboard...",
-        description: "Audience đã tạo xong, đang tải lại danh sách mới nhất từ Meta.",
+        description: "Đang tải lại danh sách audience mới nhất từ Meta.",
         value: 96,
       });
       await refreshAudiences({ silent: true });
       setCreateProgress({
         step: "Hoàn tất",
-        description: `Audience ${payload.audienceId} đã nhận ${formatNumber(payload.uploadedCount)} email hash.`,
+        description: `Audience ${completedJob.audienceId} đã nhận ${formatNumber(completedJob.syncedHashCount)} email hash.`,
         value: 100,
       });
+
       toast.success("Tạo audience thành công.", {
-        description: `Meta đã nhận ${formatNumber(payload.uploadedCount)} bản ghi đã băm.`,
+        description: `${formatNumber(completedJob.syncedHashCount)} hash đã được đồng bộ lên Meta.`,
       });
 
       setAudienceName(generateAudienceName());
       setDescription("");
-      setCreateSnapshot(null);
+      setCreateFile(null);
       dismissProgressLater(setCreateProgress);
     } catch (error) {
-      window.clearTimeout(syncStageTimer);
       const message = getErrorMessage(
         error,
         "Không thể tạo audience mới trên Meta."
@@ -356,35 +381,9 @@ export default function Home() {
 
   function openAddUsersDialog(audience: Audience) {
     setSelectedAudience(audience);
-    setUpdateSnapshot(null);
+    setUpdateFile(null);
     setUpdateProgress(null);
     setIsAddUsersDialogOpen(true);
-  }
-
-  async function handlePrepareUpdateFile(file: File) {
-    setIsPreparingUpdateFile(true);
-    setUpdateProgress({
-      step: "Đang đọc file...",
-      description: `Đang chuẩn bị dữ liệu bổ sung cho ${selectedAudience?.name ?? "audience đã chọn"}.`,
-      value: 8,
-    });
-
-    try {
-      const snapshot = await prepareUploadSnapshot(file, setUpdateProgress);
-      setUpdateSnapshot(snapshot);
-      toast.success("File đã sẵn sàng để nạp thêm.", {
-        description: `${formatNumber(snapshot.validEmailCount)} email hash sẽ được thêm vào audience hiện tại.`,
-      });
-      dismissProgressLater(setUpdateProgress);
-    } catch (error) {
-      setUpdateSnapshot(null);
-      setUpdateProgress(null);
-      toast.error("Không thể xử lý file bổ sung.", {
-        description: getErrorMessage(error, "Vui lòng kiểm tra lại nội dung file."),
-      });
-    } finally {
-      setIsPreparingUpdateFile(false);
-    }
   }
 
   async function handleAppendUsers() {
@@ -393,34 +392,43 @@ export default function Home() {
       return;
     }
 
-    if (!updateSnapshot) {
+    if (!updateFile) {
       toast.error("Hãy chọn file CSV/TXT trước khi nạp thêm dữ liệu.");
       return;
     }
 
     setIsUpdateSubmitting(true);
     setUpdateProgress({
-      step: "Đang đồng bộ dữ liệu...",
-      description: `Server đang gửi EMAIL_SHA256 vào audience ${selectedAudience.id}.`,
-      value: 84,
+      step: "Đang khởi tạo job...",
+      description: `Đang tạo job nạp thêm dữ liệu cho ${selectedAudience.name}.`,
+      value: 4,
     });
 
     try {
-      const response = await fetch(`/api/audiences/${selectedAudience.id}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          hashedEmails: updateSnapshot.hashedEmails,
-        }),
+      const job = await createAudienceJob({
+        kind: "append",
+        audienceId: selectedAudience.id,
+        fileName: updateFile.fileName,
       });
 
-      const payload = await readJsonSafe<AudienceMutationResponse>(response);
+      const summary = await uploadFileToJob({
+        file: updateFile.file,
+        jobId: job.id,
+        setProgress: setUpdateProgress,
+      });
 
-      if (!response.ok) {
-        throw new Error(payload.error || "Meta từ chối thêm dữ liệu vào audience.");
-      }
+      await finalizeAudienceJob(job.id, summary);
+
+      setUpdateProgress({
+        step: "Đang xếp hàng xử lý...",
+        description: `Các shard đã ở R2, worker sẽ nạp dần vào audience ${selectedAudience.id}.`,
+        value: 64,
+      });
+
+      const completedJob = await runAudienceJobUntilComplete(
+        job.id,
+        setUpdateProgress
+      );
 
       setUpdateProgress({
         step: "Đang làm mới dashboard...",
@@ -430,14 +438,16 @@ export default function Home() {
       await refreshAudiences({ silent: true });
       setUpdateProgress({
         step: "Hoàn tất",
-        description: `${formatNumber(payload.uploadedCount)} email hash đã được nạp thêm vào audience.`,
+        description: `${formatNumber(completedJob.syncedHashCount)} email hash đã được nạp thêm vào audience.`,
         value: 100,
       });
+
       toast.success("Bổ sung dữ liệu thành công.", {
-        description: `${formatNumber(payload.uploadedCount)} bản ghi đã được gửi lên Meta.`,
+        description: `${formatNumber(completedJob.syncedHashCount)} hash đã được gửi lên Meta.`,
       });
+
       dismissProgressLater(setUpdateProgress);
-      setUpdateSnapshot(null);
+      setUpdateFile(null);
       setIsAddUsersDialogOpen(false);
       setSelectedAudience(null);
     } catch (error) {
@@ -462,11 +472,13 @@ export default function Home() {
   function toggleAudienceSelection(audienceId: string, checked: boolean) {
     setSelectedIds((current) => {
       const nextSelection = new Set(current);
+
       if (checked) {
         nextSelection.add(audienceId);
       } else {
         nextSelection.delete(audienceId);
       }
+
       return Array.from(nextSelection);
     });
   }
@@ -554,56 +566,47 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,rgba(14,165,233,0.14),transparent_28%),radial-gradient(circle_at_top_right,rgba(16,185,129,0.12),transparent_24%),linear-gradient(180deg,#f8fafc_0%,#eef2f7_48%,#f8fafc_100%)]">
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-        <div>
-          <main className="space-y-6">
-            <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
-              <CardHeader>
-                <CardTitle>Tạo mới và đồng bộ Custom Audience</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-5">
-                <div className="grid gap-4 lg:grid-cols-[1.15fr_0.85fr]">
-                  <div className="space-y-4">
-                    <div className="space-y-2">
-                      <label className="text-sm font-medium">
-                        Tên đối tượng
-                      </label>
-                      <Input
-                        value={audienceName}
-                        onChange={(event) => setAudienceName(event.target.value)}
-                        placeholder="Ví dụ: Khách hàng VIP tháng 06"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <label className="text-sm font-medium">Mô tả</label>
-                      <Textarea
-                        value={description}
-                        onChange={(event) => setDescription(event.target.value)}
-                        placeholder="Mô tả nguồn dữ liệu, giai đoạn chiến dịch hoặc logic làm mới audience."
-                      />
-                    </div>
+        <main className="space-y-6">
+          <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
+            <CardHeader className="pb-3">
+              <CardTitle>Tạo mới Custom Audience</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Tên đối tượng</label>
+                    <Input
+                      value={audienceName}
+                      onChange={(event) => setAudienceName(event.target.value)}
+                      placeholder="Ví dụ: Khách hàng VIP tháng 06"
+                    />
                   </div>
-
-                  <UploadDropzone
-                    disabled={isPreparingCreateFile || isCreateSubmitting}
-                    title="Kéo thả file CSV/TXT để chuẩn bị dữ liệu"
-                    helperText="Tìm email hợp lệ, chuẩn hóa và băm SHA-256 ngay trong trình duyệt."
-                    snapshot={createSnapshot}
-                    onFileSelected={handlePrepareCreateFile}
-                  />
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Mô tả</label>
+                    <Textarea
+                      value={description}
+                      onChange={(event) => setDescription(event.target.value)}
+                      className="min-h-20"
+                      placeholder="Mô tả nguồn dữ liệu, giai đoạn chiến dịch hoặc logic làm mới audience."
+                    />
+                  </div>
                 </div>
 
-                <ProgressPanel progress={createProgress} />
+                <div className="space-y-3">
+                  <UploadDropzone
+                    variant="dense"
+                    disabled={isCreateSubmitting}
+                    title="Kéo thả file CSV/TXT"
+                    selection={createFile}
+                    onFileSelected={handleCreateFileSelected}
+                  />
 
-                <div className="flex justify-end rounded-2xl border border-dashed bg-muted/20 p-4">
                   <Button
                     type="button"
                     onClick={handleCreateAudience}
-                    disabled={
-                      !createSnapshot ||
-                      isPreparingCreateFile ||
-                      isCreateSubmitting
-                    }
-                    size="lg"
+                    disabled={!createFile || isCreateSubmitting}
+                    className="w-full"
                   >
                     {isCreateSubmitting ? (
                       <>
@@ -618,205 +621,197 @@ export default function Home() {
                     )}
                   </Button>
                 </div>
-              </CardContent>
-            </Card>
+              </div>
 
-            <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
-              <CardHeader className="gap-4">
-                <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-end">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-                    <div className="relative w-full sm:min-w-80">
-                      <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-                      <Input
-                        value={searchQuery}
-                        onChange={(event) => setSearchQuery(event.target.value)}
-                        className="pl-9"
-                        placeholder="Tìm kiếm theo tên hoặc ID audience"
-                      />
-                    </div>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => void refreshAudiences({ silent: true })}
-                      disabled={isRefreshing || isBootstrapping}
-                    >
-                      {isRefreshing ? (
-                        <>
-                          <Loader2 className="size-4 animate-spin" />
-                          Đang tải...
-                        </>
-                      ) : (
-                        <>
-                          <RefreshCcw className="size-4" />
-                          Làm mới
-                        </>
-                      )}
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="destructive"
-                      onClick={() => promptDelete(selectedAudiences)}
-                      disabled={selectedIds.length === 0 || isDeleting}
-                    >
-                      <Trash2 className="size-4" />
-                      Xóa đã chọn
-                    </Button>
+              <ProgressPanel progress={createProgress} />
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
+            <CardHeader className="gap-4">
+              <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-end">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                  <div className="relative w-full sm:min-w-80">
+                    <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={searchQuery}
+                      onChange={(event) => setSearchQuery(event.target.value)}
+                      className="pl-9"
+                      placeholder="Tìm kiếm theo tên hoặc ID audience"
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void refreshAudiences({ silent: true })}
+                    disabled={isRefreshing || isBootstrapping}
+                  >
+                    {isRefreshing ? (
+                      <>
+                        <Loader2 className="size-4 animate-spin" />
+                        Đang tải...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCcw className="size-4" />
+                        Làm mới
+                      </>
+                    )}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    onClick={() => promptDelete(selectedAudiences)}
+                    disabled={selectedIds.length === 0 || isDeleting}
+                  >
+                    <Trash2 className="size-4" />
+                    Xóa đã chọn
+                  </Button>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {serverError ? (
+                <div className="flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-200">
+                  <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                  <div className="space-y-1">
+                    <p className="font-medium">
+                      Dashboard chưa kết nối được với Meta API
+                    </p>
+                    <p className="text-sm leading-6">{serverError}</p>
                   </div>
                 </div>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                {serverError ? (
-                  <div className="flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-200">
-                    <AlertCircle className="mt-0.5 size-4 shrink-0" />
-                    <div className="space-y-1">
-                      <p className="font-medium">
-                        Dashboard chưa kết nối được với Meta API
-                      </p>
-                      <p className="text-sm leading-6">{serverError}</p>
-                    </div>
-                  </div>
-                ) : null}
+              ) : null}
 
-                {selectedIds.length > 0 ? (
-                  <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-                    <Badge variant="warning">
-                      Đã chọn {formatNumber(selectedIds.length)}
-                    </Badge>
-                  </div>
-                ) : null}
+              {selectedIds.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                  <Badge variant="warning">
+                    Đã chọn {formatNumber(selectedIds.length)}
+                  </Badge>
+                </div>
+              ) : null}
 
-                <div className="overflow-hidden rounded-2xl border">
-                  <Table>
-                    <TableHeader>
-                      <TableRow className="bg-muted/35">
-                        <TableHead className="w-12">
-                          <Checkbox
-                            aria-label="Chọn tất cả audience đang hiển thị"
-                            checked={allVisibleSelected}
-                            indeterminate={someVisibleSelected}
-                            onCheckedChange={toggleSelectAllVisible}
-                          />
-                        </TableHead>
-                        <TableHead>Tên đối tượng</TableHead>
-                        <TableHead>Mô tả</TableHead>
-                        <TableHead>Trạng thái</TableHead>
-                        <TableHead>Quy mô ước tính</TableHead>
-                        <TableHead>Lần chỉnh sửa cuối</TableHead>
-                        <TableHead className="text-right">Hành động</TableHead>
+              <div className="overflow-hidden rounded-2xl border">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="bg-muted/35">
+                      <TableHead className="w-12">
+                        <Checkbox
+                          aria-label="Chọn tất cả audience đang hiển thị"
+                          checked={allVisibleSelected}
+                          indeterminate={someVisibleSelected}
+                          onCheckedChange={toggleSelectAllVisible}
+                        />
+                      </TableHead>
+                      <TableHead>Tên đối tượng</TableHead>
+                      <TableHead>Mô tả</TableHead>
+                      <TableHead>Trạng thái</TableHead>
+                      <TableHead>Quy mô ước tính</TableHead>
+                      <TableHead className="text-right">Hành động</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {isBootstrapping ? (
+                      <TableRow>
+                        <TableCell colSpan={6} className="py-10">
+                          <div className="flex items-center justify-center gap-3 text-muted-foreground">
+                            <Loader2 className="size-4 animate-spin" />
+                            Đang tải danh sách Custom Audiences...
+                          </div>
+                        </TableCell>
                       </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {isBootstrapping ? (
-                        <TableRow>
-                          <TableCell colSpan={7} className="py-10">
-                            <div className="flex items-center justify-center gap-3 text-muted-foreground">
-                              <Loader2 className="size-4 animate-spin" />
-                              Đang tải danh sách Custom Audiences...
+                    ) : filteredAudiences.length === 0 ? (
+                      <TableRow>
+                        <TableCell colSpan={6} className="py-12">
+                          <div className="flex flex-col items-center gap-3 text-center">
+                            <div className="flex size-12 items-center justify-center rounded-2xl border bg-muted/40">
+                              <Users className="size-5 text-muted-foreground" />
+                            </div>
+                            <div className="space-y-1">
+                              <p className="font-medium">
+                                Không có audience nào khớp bộ lọc hiện tại.
+                              </p>
+                              <p className="text-sm text-muted-foreground">
+                                Hãy tạo audience mới hoặc điều chỉnh từ khóa tìm kiếm.
+                              </p>
+                            </div>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ) : (
+                      filteredAudiences.map((audience) => (
+                        <TableRow
+                          key={audience.id}
+                          data-state={
+                            selectedIdSet.has(audience.id) ? "selected" : undefined
+                          }
+                        >
+                          <TableCell>
+                            <Checkbox
+                              aria-label={`Chọn audience ${audience.name}`}
+                              checked={selectedIdSet.has(audience.id)}
+                              onCheckedChange={(checked) =>
+                                toggleAudienceSelection(audience.id, checked)
+                              }
+                            />
+                          </TableCell>
+                          <TableCell className="align-top">
+                            <div className="space-y-2">
+                              <Button
+                                type="button"
+                                variant="link"
+                                className="h-auto px-0 text-left text-sm font-semibold text-slate-900 hover:text-sky-700"
+                                onClick={() => openAddUsersDialog(audience)}
+                              >
+                                {audience.name}
+                              </Button>
+                              <div className="flex flex-wrap gap-2">
+                                <Badge variant="outline" className="font-mono">
+                                  {audience.id}
+                                </Badge>
+                              </div>
+                            </div>
+                          </TableCell>
+                          <TableCell className="max-w-72 whitespace-normal text-sm text-muted-foreground">
+                            {audience.description || "Chưa có mô tả"}
+                          </TableCell>
+                          <TableCell>
+                            <AvailabilityBadge availability={audience.availability} />
+                          </TableCell>
+                          <TableCell className="font-medium">
+                            {formatAudienceSize(audience)}
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex justify-end gap-2">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => openAddUsersDialog(audience)}
+                              >
+                                <Upload className="size-4" />
+                                Thêm người dùng
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="destructive"
+                                size="sm"
+                                onClick={() => promptDelete([audience])}
+                              >
+                                <Trash2 className="size-4" />
+                                Xóa
+                              </Button>
                             </div>
                           </TableCell>
                         </TableRow>
-                      ) : filteredAudiences.length === 0 ? (
-                        <TableRow>
-                          <TableCell colSpan={7} className="py-12">
-                            <div className="flex flex-col items-center gap-3 text-center">
-                              <div className="flex size-12 items-center justify-center rounded-2xl border bg-muted/40">
-                                <Users className="size-5 text-muted-foreground" />
-                              </div>
-                              <div className="space-y-1">
-                                <p className="font-medium">
-                                  Không có audience nào khớp bộ lọc hiện tại.
-                                </p>
-                                <p className="text-sm text-muted-foreground">
-                                  Hãy tạo audience mới hoặc điều chỉnh tìm kiếm /
-                                  bộ lọc bên trái.
-                                </p>
-                              </div>
-                            </div>
-                          </TableCell>
-                        </TableRow>
-                      ) : (
-                        filteredAudiences.map((audience) => (
-                          <TableRow
-                            key={audience.id}
-                            data-state={
-                              selectedIdSet.has(audience.id) ? "selected" : undefined
-                            }
-                          >
-                            <TableCell>
-                              <Checkbox
-                                aria-label={`Chọn audience ${audience.name}`}
-                                checked={selectedIdSet.has(audience.id)}
-                                onCheckedChange={(checked) =>
-                                  toggleAudienceSelection(audience.id, checked)
-                                }
-                              />
-                            </TableCell>
-                            <TableCell className="align-top">
-                              <div className="space-y-2">
-                                <Button
-                                  type="button"
-                                  variant="link"
-                                  className="h-auto px-0 text-left text-sm font-semibold text-slate-900 hover:text-sky-700"
-                                  onClick={() => openAddUsersDialog(audience)}
-                                >
-                                  {audience.name}
-                                </Button>
-                                <div className="flex flex-wrap gap-2">
-                                  <Badge variant="outline" className="font-mono">
-                                    {audience.id}
-                                  </Badge>
-                                  {isAudienceExpiringSoon(audience.timeUpdated) ? (
-                                    <Badge variant="warning">Sắp hết hạn</Badge>
-                                  ) : null}
-                                </div>
-                              </div>
-                            </TableCell>
-                            <TableCell className="max-w-72 whitespace-normal text-sm text-muted-foreground">
-                              {audience.description || "Chưa có mô tả"}
-                            </TableCell>
-                            <TableCell>
-                              <AvailabilityBadge
-                                availability={audience.availability}
-                              />
-                            </TableCell>
-                            <TableCell className="font-medium">
-                              {formatAudienceSize(audience)}
-                            </TableCell>
-                            <TableCell className="text-sm text-muted-foreground">
-                              {formatDateTime(audience.timeUpdated)}
-                            </TableCell>
-                            <TableCell>
-                              <div className="flex justify-end gap-2">
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => openAddUsersDialog(audience)}
-                                >
-                                  <Upload className="size-4" />
-                                  Thêm người dùng
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="destructive"
-                                  size="sm"
-                                  onClick={() => promptDelete([audience])}
-                                >
-                                  <Trash2 className="size-4" />
-                                  Xóa
-                                </Button>
-                              </div>
-                            </TableCell>
-                          </TableRow>
-                        ))
-                      )}
-                    </TableBody>
-                  </Table>
-                </div>
-              </CardContent>
-            </Card>
-          </main>
-        </div>
+                      ))
+                    )}
+                  </TableBody>
+                </Table>
+              </div>
+            </CardContent>
+          </Card>
+        </main>
       </div>
 
       <Dialog
@@ -829,7 +824,7 @@ export default function Home() {
           setIsAddUsersDialogOpen(open);
           if (!open) {
             setSelectedAudience(null);
-            setUpdateSnapshot(null);
+            setUpdateFile(null);
             setUpdateProgress(null);
           }
         }}
@@ -847,12 +842,11 @@ export default function Home() {
 
           <div className="mt-5 space-y-5">
             <UploadDropzone
-              compact
-              disabled={isPreparingUpdateFile || isUpdateSubmitting}
-              title="Tải file CSV/TXT mới để nạp thêm vào audience"
-              helperText="Dữ liệu sẽ được chuẩn hóa và băm SHA-256 trước khi gửi vào /users."
-              snapshot={updateSnapshot}
-              onFileSelected={handlePrepareUpdateFile}
+              variant="compact"
+              disabled={isUpdateSubmitting}
+              title="Kéo thả file CSV/TXT"
+              selection={updateFile}
+              onFileSelected={handleUpdateFileSelected}
             />
 
             <ProgressPanel progress={updateProgress} />
@@ -865,7 +859,7 @@ export default function Home() {
               onClick={() => {
                 setIsAddUsersDialogOpen(false);
                 setSelectedAudience(null);
-                setUpdateSnapshot(null);
+                setUpdateFile(null);
                 setUpdateProgress(null);
               }}
               disabled={isUpdateSubmitting}
@@ -875,7 +869,7 @@ export default function Home() {
             <Button
               type="button"
               onClick={handleAppendUsers}
-              disabled={!updateSnapshot || isPreparingUpdateFile || isUpdateSubmitting}
+              disabled={!updateFile || isUpdateSubmitting}
             >
               {isUpdateSubmitting ? (
                 <>
@@ -966,16 +960,14 @@ export default function Home() {
 function UploadDropzone({
   disabled,
   title,
-  helperText,
-  snapshot,
-  compact = false,
+  selection,
+  variant = "default",
   onFileSelected,
 }: {
   disabled?: boolean;
   title: string;
-  helperText: string;
-  snapshot: UploadSnapshot | null;
-  compact?: boolean;
+  selection: FileSelection | null;
+  variant?: "default" | "compact" | "dense";
   onFileSelected: (file: File) => Promise<void>;
 }) {
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -995,13 +987,20 @@ function UploadDropzone({
     },
   });
 
+  const isDense = variant === "dense";
+  const isCompact = variant === "compact";
+
   return (
     <div className="space-y-3">
       <div
         {...getRootProps()}
         className={cn(
-          "group rounded-[24px] border border-dashed px-5 py-6 transition-colors",
-          compact ? "min-h-52" : "min-h-60",
+          "group rounded-[24px] border border-dashed transition-colors",
+          isDense
+            ? "min-h-40 px-4 py-4"
+            : isCompact
+              ? "min-h-52 px-5 py-6"
+              : "min-h-60 px-5 py-6",
           disabled
             ? "cursor-not-allowed border-border bg-muted/20 opacity-70"
             : "cursor-pointer border-border bg-muted/15 hover:border-sky-400 hover:bg-sky-500/[0.03]",
@@ -1009,40 +1008,36 @@ function UploadDropzone({
         )}
       >
         <input {...getInputProps()} />
-        <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
+        <div
+          className={cn(
+            "flex h-full flex-col items-center justify-center text-center",
+            isDense ? "gap-3" : "gap-4"
+          )}
+        >
           <div
             className={cn(
-              "flex size-14 items-center justify-center rounded-2xl border bg-background shadow-sm",
+              isDense
+                ? "flex size-11 items-center justify-center rounded-xl border bg-background shadow-sm"
+                : "flex size-14 items-center justify-center rounded-2xl border bg-background shadow-sm",
               isDragActive
                 ? "border-sky-500 text-sky-600"
                 : "border-border text-muted-foreground"
             )}
           >
-            <Upload className="size-5" />
+            <Upload className={cn(isDense ? "size-4" : "size-5")} />
           </div>
           <div className="space-y-1">
-            <p className="text-sm font-medium">
+            <p className={cn("font-medium", isDense ? "text-[13px]" : "text-sm")}>
               {isDragActive ? "Thả file vào đây để bắt đầu xử lý" : title}
             </p>
-            <p className="text-sm text-muted-foreground">{helperText}</p>
           </div>
-          <p className="text-xs text-muted-foreground">
-            Hỗ trợ `.csv` và `.txt`. Plaintext email không rời khỏi trình duyệt.
-          </p>
         </div>
       </div>
 
-      {snapshot ? (
+      {selection ? (
         <div className="flex flex-wrap gap-2">
-          <Badge variant="outline">{snapshot.fileName}</Badge>
-          <Badge variant="secondary">
-            {formatNumber(snapshot.validEmailCount)} email hash
-          </Badge>
-          {snapshot.duplicateCount > 0 ? (
-            <Badge variant="warning">
-              Đã loại {formatNumber(snapshot.duplicateCount)} trùng lặp
-            </Badge>
-          ) : null}
+          <Badge variant="outline">{selection.fileName}</Badge>
+          <Badge variant="secondary">{formatFileSize(selection.fileSize)}</Badge>
         </div>
       ) : null}
     </div>
@@ -1082,86 +1077,175 @@ function AvailabilityBadge({
   return <Badge variant="warning">Populating</Badge>;
 }
 
-async function prepareUploadSnapshot(
-  file: File,
-  setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>
-): Promise<UploadSnapshot> {
-  setProgress({
-    step: "Đang đọc file...",
-    description: "PapaParse đang đọc dữ liệu tại client và tách từng ô nội dung.",
-    value: 14,
-  });
+async function uploadFileToJob({
+  file,
+  jobId,
+  setProgress,
+}: {
+  file: File;
+  jobId: string;
+  setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>;
+}): Promise<UploadPipelineSummary> {
+  return new Promise((resolve, reject) => {
+    let parseCursor = 0;
+    const pendingEmails: string[] = [];
+    const pendingHashes: string[] = [];
+    let totalParts = 0;
+    let duplicateCount = 0;
+    const seenHashes = new Set<string>();
+    let settled = false;
 
-  const parseResult = await new Promise<Papa.ParseResult<string[]>>(
-    (resolve, reject) => {
-      Papa.parse<string[]>(file, {
-        skipEmptyLines: "greedy",
-        worker: true,
-        complete: resolve,
-        error: reject,
+    const fail = (error: unknown) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(error);
+    };
+
+    const finish = (summary: UploadPipelineSummary) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      resolve(summary);
+    };
+
+    const flushHashesToR2 = async (force: boolean) => {
+      while (
+        pendingHashes.length >= CLIENT_UPLOAD_CHUNK_SIZE ||
+        (force && pendingHashes.length > 0)
+      ) {
+        const chunk = pendingHashes.splice(0, CLIENT_UPLOAD_CHUNK_SIZE);
+        const parseRatio = file.size > 0 ? Math.min(parseCursor / file.size, 1) : 1;
+        const partNumber = totalParts + 1;
+
+        setProgress({
+          step: "Đang tải shard lên R2...",
+          description: `Đang gửi shard ${formatNumber(partNumber)} với ${formatNumber(chunk.length)} hash lên R2.`,
+          value: Math.min(60, 42 + Math.round(parseRatio * 18)),
+        });
+
+        await uploadAudienceJobPart(jobId, totalParts, chunk);
+        totalParts += 1;
+        await waitFor(0);
+      }
+    };
+
+    const flushEmails = async () => {
+      if (pendingEmails.length === 0) {
+        return;
+      }
+
+      const emailBatch = pendingEmails.splice(0, pendingEmails.length);
+      const parseRatio = file.size > 0 ? Math.min(parseCursor / file.size, 1) : 1;
+
+      const hashedBatch = await hashEmailList(emailBatch, (completed, total) => {
+        const batchRatio = total === 0 ? 1 : completed / total;
+        setProgress({
+          step: "Đang mã hóa dữ liệu...",
+          description: `Đã băm ${formatNumber(completed)} / ${formatNumber(total)} email trong lô hiện tại.`,
+          value: Math.min(52, 20 + Math.round(parseRatio * 18 + batchRatio * 14)),
+        });
       });
-    }
-  );
 
-  setProgress({
-    step: "Đang đọc file...",
-    description: "Đang lọc email hợp lệ, chuyển về chữ thường và loại khoảng trắng thừa.",
-    value: 28,
-  });
+      for (const hash of hashedBatch) {
+        if (seenHashes.has(hash)) {
+          duplicateCount += 1;
+          continue;
+        }
 
-  const normalizedEmails = extractNormalizedEmails(parseResult.data);
+        seenHashes.add(hash);
+        pendingHashes.push(hash);
+      }
 
-  if (normalizedEmails.length === 0) {
-    throw new Error("Không tìm thấy email hợp lệ trong file vừa tải lên.");
-  }
+      await flushHashesToR2(false);
+    };
 
-  const uniqueEmails = Array.from(new Set(normalizedEmails));
-  const duplicateCount = normalizedEmails.length - uniqueEmails.length;
+    const flushAll = async () => {
+      await flushEmails();
+      await flushHashesToR2(true);
 
-  setProgress({
-    step: "Đang mã hóa dữ liệu...",
-    description: `Đang băm ${formatNumber(uniqueEmails.length)} email bằng Web Crypto API.`,
-    value: 34,
-  });
+      if (seenHashes.size === 0) {
+        throw new Error("Không tìm thấy email hợp lệ trong file vừa tải lên.");
+      }
 
-  const hashedEmails = await hashEmailList(uniqueEmails, (completed, total) => {
-    const ratio = total === 0 ? 1 : completed / total;
-    setProgress({
-      step: "Đang mã hóa dữ liệu...",
-      description: `Đã băm ${formatNumber(completed)} / ${formatNumber(total)} email hợp lệ.`,
-      value: 34 + Math.round(ratio * 32),
+      setProgress({
+        step: "Đang chốt job...",
+        description: `${formatNumber(totalParts)} shard hash đã sẵn sàng để worker đồng bộ lên Meta.`,
+        value: 60,
+      });
+
+      finish({
+        totalParts,
+        uniqueHashCount: seenHashes.size,
+        duplicateCount,
+      });
+    };
+
+    Papa.parse<string[]>(file, {
+      skipEmptyLines: "greedy",
+      worker: false,
+      step: (results, parser) => {
+        if (settled) {
+          parser.abort();
+          return;
+        }
+
+        parseCursor = results.meta.cursor;
+        const row = Array.isArray(results.data) ? results.data : [];
+        const emails = extractNormalizedEmailsFromCells(row);
+
+        if (emails.length > 0) {
+          pendingEmails.push(...emails);
+        }
+
+        const parseRatio = file.size > 0 ? Math.min(parseCursor / file.size, 1) : 1;
+
+        if (pendingEmails.length >= HASH_BATCH_SIZE) {
+          parser.pause();
+          void flushEmails()
+            .then(() => {
+              if (!settled) {
+                parser.resume();
+              }
+            })
+            .catch((error) => {
+              parser.abort();
+              fail(error);
+            });
+          return;
+        }
+
+        setProgress({
+          step: "Đang đọc file...",
+          description: `PapaParse đang quét ${file.name} trực tiếp trên trình duyệt.`,
+          value: Math.min(18, 8 + Math.round(parseRatio * 10)),
+        });
+      },
+      complete: () => {
+        void flushAll().catch(fail);
+      },
+      error: fail,
     });
   });
-
-  setProgress({
-    step: "Sẵn sàng đồng bộ",
-    description: `${formatNumber(uniqueEmails.length)} email hash đã sẵn sàng để gửi lên server.`,
-    value: 100,
-  });
-
-  return {
-    fileName: file.name,
-    validEmailCount: uniqueEmails.length,
-    duplicateCount,
-    hashedEmails,
-  };
 }
 
-function extractNormalizedEmails(rows: string[][]) {
+function extractNormalizedEmailsFromCells(cells: string[]) {
   const emails: string[] = [];
 
-  for (const row of rows) {
-    for (const cell of row) {
-      const chunks = cell
-        .replace(/\uFEFF/g, "")
-        .split(/[\s;|]+/)
-        .map((token) => token.trim().toLowerCase())
-        .filter(Boolean);
+  for (const cell of cells) {
+    const chunks = String(cell)
+      .replace(/\uFEFF/g, "")
+      .split(/[\s;|]+/)
+      .map((token) => token.trim().toLowerCase())
+      .filter(Boolean);
 
-      for (const candidate of chunks) {
-        if (EMAIL_PATTERN.test(candidate)) {
-          emails.push(candidate);
-        }
+    for (const candidate of chunks) {
+      if (EMAIL_PATTERN.test(candidate)) {
+        emails.push(candidate);
       }
     }
   }
@@ -1181,7 +1265,7 @@ async function hashEmailList(
     const hashedChunk = await Promise.all(chunk.map(hashSha256));
     hashedEmails.push(...hashedChunk);
     onProgress(Math.min(index + chunk.length, emails.length), emails.length);
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    await waitFor(0);
   }
 
   return hashedEmails;
@@ -1193,6 +1277,177 @@ async function hashSha256(input: string) {
   return Array.from(new Uint8Array(digest))
     .map((value) => value.toString(16).padStart(2, "0"))
     .join("");
+}
+
+async function createAudienceJob(input: {
+  kind: AudienceJobKind;
+  fileName: string;
+  name?: string;
+  description?: string;
+  audienceId?: string;
+}) {
+  const response = await fetch("/api/upload-jobs", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(input),
+  });
+  const payload = await readJsonSafe<AudienceJobResponse>(response);
+
+  if (!response.ok || !payload.job) {
+    throw new Error(payload.error || "Không thể tạo upload job.");
+  }
+
+  return payload.job;
+}
+
+async function uploadAudienceJobPart(
+  jobId: string,
+  partIndex: number,
+  hashedEmails: string[]
+) {
+  const presignResponse = await fetch(
+    `/api/upload-jobs/${jobId}/parts/presign`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        partIndex,
+      }),
+    }
+  );
+  const presignPayload = await readJsonSafe<UploadPartPresignResponse>(
+    presignResponse
+  );
+
+  if (
+    !presignResponse.ok ||
+    !presignPayload.uploadUrl ||
+    !presignPayload.objectKey
+  ) {
+    throw new Error(presignPayload.error || "Không thể presign shard upload.");
+  }
+
+  const r2Response = await fetch(presignPayload.uploadUrl, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(hashedEmails),
+  });
+
+  if (!r2Response.ok) {
+    throw new Error("R2 từ chối shard upload hiện tại.");
+  }
+
+  const response = await fetch(`/api/upload-jobs/${jobId}/parts/complete`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      partIndex,
+      hashCount: hashedEmails.length,
+      objectKey: presignPayload.objectKey,
+    }),
+  });
+  const payload = await readJsonSafe<AudienceJobResponse>(response);
+
+  if (!response.ok || !payload.job) {
+    throw new Error(payload.error || "Không thể ack shard upload.");
+  }
+
+  return payload.job;
+}
+
+async function finalizeAudienceJob(
+  jobId: string,
+  summary: UploadPipelineSummary
+) {
+  const response = await fetch(`/api/upload-jobs/${jobId}/finalize`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      totalParts: summary.totalParts,
+      totalHashes: summary.uniqueHashCount,
+      duplicateCount: summary.duplicateCount,
+    }),
+  });
+  const payload = await readJsonSafe<AudienceJobResponse>(response);
+
+  if (!response.ok || !payload.job) {
+    throw new Error(payload.error || "Không thể chốt upload job.");
+  }
+
+  return payload.job;
+}
+
+async function runAudienceJobUntilComplete(
+  jobId: string,
+  setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>
+) {
+  while (true) {
+    const response = await fetch(`/api/upload-jobs/${jobId}`, {
+      cache: "no-store",
+    });
+    const payload = await readJsonSafe<AudienceJobResponse>(response);
+
+    if (!response.ok || !payload.job) {
+      throw new Error(payload.error || "Không thể xử lý upload job.");
+    }
+
+    const job = payload.job;
+    setProgress(buildJobSyncProgress(job));
+
+    if (job.status === "completed") {
+      return job;
+    }
+
+    if (job.status === "failed") {
+      throw new Error(job.errorMessage || "Meta từ chối job upload hiện tại.");
+    }
+
+    await waitFor(JOB_POLL_DELAY_MS);
+  }
+}
+
+function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
+  if (job.status === "queued") {
+    return {
+      step: "Đang chờ worker xử lý...",
+      description: "BullMQ đã nhận job và đang chờ lượt đồng bộ lên Meta.",
+      value: 66,
+    };
+  }
+
+  if (job.kind === "create" && !job.audienceId) {
+    return {
+      step: "Đang khởi tạo đối tượng trên Meta...",
+      description: "Worker đang tạo audience trống trước khi nạp các shard hash.",
+      value: 66,
+    };
+  }
+
+  const totalHashes = job.totalHashes ?? job.receivedHashCount;
+  const syncedHashes = Math.min(job.syncedHashCount, totalHashes);
+  const ratio = totalHashes > 0 ? syncedHashes / totalHashes : 0;
+
+  return {
+    step: job.status === "completed" ? "Hoàn tất" : "Đang đồng bộ dữ liệu...",
+    description:
+      totalHashes > 0
+        ? `Đã đồng bộ ${formatNumber(syncedHashes)} / ${formatNumber(totalHashes)} hash lên Meta.`
+        : `Đã xử lý ${formatNumber(job.processedPartCount)} shard.`,
+    value:
+      job.status === "completed"
+        ? 100
+        : Math.min(98, 68 + Math.round(ratio * 28)),
+  };
 }
 
 async function fetchAudiencesFromApi() {
@@ -1226,23 +1481,6 @@ function generateAudienceName() {
   return `Customer File Audience ${timestamp}`;
 }
 
-function isAudienceExpiringSoon(timeUpdated: string | null) {
-  if (!timeUpdated) {
-    return false;
-  }
-
-  const updatedAt = new Date(timeUpdated);
-
-  if (Number.isNaN(updatedAt.getTime())) {
-    return false;
-  }
-
-  const elapsedDays =
-    (Date.now() - updatedAt.getTime()) / (1000 * 60 * 60 * 24);
-
-  return elapsedDays >= EXPIRING_SOON_DAYS;
-}
-
 function formatAudienceSize(audience: Audience) {
   if (audience.sizeUpperBound === null) {
     return "Đang ước tính";
@@ -1261,21 +1499,25 @@ function formatAudienceSize(audience: Audience) {
   return `≈ ${formatNumber(audience.sizeUpperBound)}`;
 }
 
-function formatDateTime(value: string | null) {
-  if (!value) {
-    return "Chưa có dữ liệu";
-  }
-
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "Chưa có dữ liệu";
-  }
-
-  return dateTimeFormatter.format(date);
-}
-
 function formatNumber(value: number) {
   return numberFormatter.format(value);
+}
+
+function formatFileSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let index = 0;
+
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+
+  return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`;
 }
 
 function getErrorMessage(error: unknown, fallbackMessage: string) {
@@ -1293,4 +1535,10 @@ function dismissProgressLater(
   window.setTimeout(() => {
     setProgress(null);
   }, delay);
+}
+
+function waitFor(delayMs: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, delayMs);
+  });
 }
