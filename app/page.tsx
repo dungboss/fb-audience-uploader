@@ -1,8 +1,6 @@
 "use client";
 
 import { startTransition, useDeferredValue, useEffect, useState } from "react";
-import type { Accept } from "react-dropzone";
-import { useDropzone } from "react-dropzone";
 import Papa from "papaparse";
 import { toast } from "sonner";
 import {
@@ -50,13 +48,6 @@ import {
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { NasFileBrowserDialog } from "@/components/nas-file-browser-dialog";
-import { cn } from "@/lib/utils";
-
-const DROPZONE_ACCEPT: Accept = {
-  "text/csv": [".csv"],
-  "text/plain": [".txt"],
-  "application/vnd.ms-excel": [".csv"],
-};
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const HASH_BATCH_SIZE = 400;
@@ -300,17 +291,6 @@ export default function Home() {
       source,
       sourceLabel,
     };
-  }
-
-  async function handleCreateFileSelected(file: File) {
-    setCreateFile(buildFileSelection(file, "local"));
-    setCreateProgress(null);
-    setAudienceName(file.name.replace(/\.[^/.]+$/, ""));
-  }
-
-  async function handleUpdateFileSelected(file: File) {
-    setUpdateFile(buildFileSelection(file, "local"));
-    setUpdateProgress(null);
   }
 
   function openNasBrowser(target: NasBrowseTarget) {
@@ -643,10 +623,9 @@ export default function Home() {
                   <UploadDropzone
                     variant="dense"
                     disabled={isCreateSubmitting}
-                    title="Kéo thả file CSV/TXT hoặc chọn từ NAS"
+                    title="Chọn file CSV/TXT từ NAS"
                     selection={createFile}
                     onBrowseNas={() => openNasBrowser("create")}
-                    onFileSelected={handleCreateFileSelected}
                   />
 
                   <Button
@@ -891,10 +870,9 @@ export default function Home() {
             <UploadDropzone
               variant="compact"
               disabled={isUpdateSubmitting}
-              title="Kéo thả file CSV/TXT hoặc chọn từ NAS"
+              title="Chọn file CSV/TXT từ NAS"
               selection={updateFile}
               onBrowseNas={() => openNasBrowser("update")}
-              onFileSelected={handleUpdateFileSelected}
             />
 
             <ProgressPanel progress={updateProgress} />
@@ -1021,80 +999,15 @@ function UploadDropzone({
   title,
   onBrowseNas,
   selection,
-  variant = "default",
-  onFileSelected,
 }: {
   disabled?: boolean;
   title: string;
   onBrowseNas?: () => void;
   selection: FileSelection | null;
   variant?: "default" | "compact" | "dense";
-  onFileSelected: (file: File) => Promise<void>;
 }) {
-  const { getRootProps, getInputProps, isDragActive } = useDropzone({
-    accept: DROPZONE_ACCEPT,
-    maxFiles: 1,
-    multiple: false,
-    disabled,
-    onDrop: (acceptedFiles, rejectedFiles) => {
-      if (rejectedFiles.length > 0) {
-        toast.error("Chỉ chấp nhận file .csv hoặc .txt.");
-      }
-
-      const file = acceptedFiles[0];
-      if (file) {
-        void onFileSelected(file);
-      }
-    },
-  });
-
-  const isDense = variant === "dense";
-  const isCompact = variant === "compact";
-
   return (
     <div className="space-y-3">
-      <div
-        {...getRootProps()}
-        className={cn(
-          "group rounded-[24px] border border-dashed transition-colors",
-          isDense
-            ? "min-h-40 px-4 py-4"
-            : isCompact
-              ? "min-h-52 px-5 py-6"
-              : "min-h-60 px-5 py-6",
-          disabled
-            ? "cursor-not-allowed border-border bg-muted/20 opacity-70"
-            : "cursor-pointer border-border bg-muted/15 hover:border-sky-400 hover:bg-sky-500/[0.03]",
-          isDragActive && "border-sky-500 bg-sky-500/5"
-        )}
-      >
-        <input {...getInputProps()} />
-        <div
-          className={cn(
-            "flex h-full flex-col items-center justify-center text-center",
-            isDense ? "gap-3" : "gap-4"
-          )}
-        >
-          <div
-            className={cn(
-              isDense
-                ? "flex size-11 items-center justify-center rounded-xl border bg-background shadow-sm"
-                : "flex size-14 items-center justify-center rounded-2xl border bg-background shadow-sm",
-              isDragActive
-                ? "border-sky-500 text-sky-600"
-                : "border-border text-muted-foreground"
-            )}
-          >
-            <Upload className={cn(isDense ? "size-4" : "size-5")} />
-          </div>
-          <div className="space-y-1">
-            <p className={cn("font-medium", isDense ? "text-[13px]" : "text-sm")}>
-              {isDragActive ? "Thả file vào đây để bắt đầu xử lý" : title}
-            </p>
-          </div>
-        </div>
-      </div>
-
       {selection ? (
         <div className="space-y-2">
           <div className="flex flex-wrap gap-2">
@@ -1112,7 +1025,9 @@ function UploadDropzone({
             </p>
           ) : null}
         </div>
-      ) : null}
+      ) : (
+        <p className="text-sm text-muted-foreground">{title}</p>
+      )}
 
       {onBrowseNas ? (
         <Button
