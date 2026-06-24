@@ -146,6 +146,68 @@ export const getWebDavAuthHeaders = () => {
   return headers;
 };
 
+export async function writeTextToWebDav(
+  requestedPath: string,
+  content: string
+): Promise<void> {
+  const normalizedPath = normalizeWebDavPath(requestedPath);
+
+  await ensureWebDavParentDirectory(normalizedPath);
+
+  const response = await fetch(buildWebDavUrl(normalizedPath, false), {
+    method: "PUT",
+    headers: {
+      ...getWebDavAuthHeaders(),
+      "Content-Type": "application/json; charset=utf-8",
+    },
+    body: content,
+  });
+
+  if (!response.ok) {
+    throw new Error(`WebDAV file write failed (${response.status})`);
+  }
+}
+
+export async function deleteWebDavFile(requestedPath: string): Promise<void> {
+  const normalizedPath = normalizeWebDavPath(requestedPath);
+  const response = await fetch(buildWebDavUrl(normalizedPath, false), {
+    method: "DELETE",
+    headers: {
+      ...getWebDavAuthHeaders(),
+    },
+  });
+
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`WebDAV file delete failed (${response.status})`);
+  }
+}
+
+async function ensureWebDavParentDirectory(
+  requestedPath: string
+): Promise<void> {
+  const normalizedPath = normalizeWebDavPath(requestedPath);
+  const segments = normalizedPath.split("/").filter(Boolean);
+
+  for (let index = 0; index < segments.length; index++) {
+    const directoryPath = `/${segments.slice(0, index).join("/")}`;
+
+    if (!directoryPath || directoryPath === "/") {
+      continue;
+    }
+
+    const response = await fetch(buildWebDavUrl(directoryPath, true), {
+      method: "MKCOL",
+      headers: {
+        ...getWebDavAuthHeaders(),
+      },
+    });
+
+    if (!response.ok && response.status !== 405) {
+      throw new Error(`WebDAV directory creation failed (${response.status})`);
+    }
+  }
+}
+
 export async function fetchWebDavDirectoryResponse(
   requestedPath: string
 ): Promise<WebDavDirectoryResponse> {

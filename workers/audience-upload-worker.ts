@@ -18,7 +18,7 @@ import {
   getBullConnectionOptions,
   getRedis,
 } from "../lib/audience-upload/redis";
-import { deleteShardObject, readShardHashes } from "../lib/audience-upload/s3";
+import { deleteShardObject, readShardHashes } from "../lib/audience-upload/storage";
 import type { AudienceUploadJobPayload } from "../lib/audience-upload/types";
 
 const FACEBOOK_MAX_HASHES_PER_SECOND = 10_000;

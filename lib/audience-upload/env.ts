@@ -1,16 +1,12 @@
 import { FacebookApiError } from "@/app/api/audiences/meta";
 
 const DEFAULT_QUEUE_NAME = "audience-upload-sync";
-const DEFAULT_S3_PREFIX = "audience-uploads";
-const DEFAULT_R2_REGION = "auto";
+const DEFAULT_SHARD_TEMP_DIR = "/temp/fb-audience-uploader";
 
 export interface AudienceUploadConfig {
   redisUrl: string;
   queueName: string;
-  s3Bucket: string;
-  s3Region: string;
-  s3Endpoint: string;
-  s3Prefix: string;
+  shardTempDir: string;
   jobTtlSeconds: number;
   presignedUrlTtlSeconds: number;
   jobAttempts: number;
@@ -20,8 +16,8 @@ export interface AudienceUploadConfig {
   metaRequestIntervalMs: number;
   metaRateLimitDelayMs: number;
   metaBatchSize: number;
-  accessKeyId?: string;
-  secretAccessKey?: string;
+  webdavUsername?: string;
+  webdavPassword?: string;
 }
 
 let cachedConfig: AudienceUploadConfig | null = null;
@@ -32,26 +28,12 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
   }
 
   const redisUrl = readRequiredEnv("REDIS_URL");
-  const r2AccountId = readOptionalEnv("R2_ACCOUNT_ID");
-  const s3Bucket = pickRequiredEnv(["R2_BUCKET", "AWS_S3_BUCKET"]);
-  const s3Region =
-    readOptionalEnv("R2_REGION") ??
-    readOptionalEnv("AWS_REGION") ??
-    DEFAULT_R2_REGION;
-  const s3Endpoint =
-    readOptionalEnv("R2_ENDPOINT") ??
-    (r2AccountId
-      ? `https://${r2AccountId}.r2.cloudflarestorage.com`
-      : undefined) ??
-    readOptionalEnv("AWS_S3_ENDPOINT");
 
   cachedConfig = {
     redisUrl,
     queueName: readOptionalEnv("UPLOAD_JOB_QUEUE_NAME") ?? DEFAULT_QUEUE_NAME,
-    s3Bucket,
-    s3Region,
-    s3Endpoint: s3Endpoint ?? "",
-    s3Prefix: readOptionalEnv("UPLOAD_JOB_S3_PREFIX") ?? DEFAULT_S3_PREFIX,
+    shardTempDir:
+      readOptionalEnv("UPLOAD_JOB_NAS_TEMP_DIR") ?? DEFAULT_SHARD_TEMP_DIR,
     jobTtlSeconds: readNumberEnv("UPLOAD_JOB_TTL_SECONDS", 24 * 60 * 60),
     presignedUrlTtlSeconds: readNumberEnv("UPLOAD_PRESIGN_TTL_SECONDS", 15 * 60),
     jobAttempts: readNumberEnv("UPLOAD_JOB_ATTEMPTS", 168),
@@ -70,19 +52,9 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
       60 * 60 * 1_000
     ),
     metaBatchSize: readNumberEnv("UPLOAD_META_BATCH_SIZE", 10_000),
-    accessKeyId:
-      readOptionalEnv("R2_ACCESS_KEY_ID") ?? readOptionalEnv("AWS_ACCESS_KEY_ID"),
-    secretAccessKey:
-      readOptionalEnv("R2_SECRET_ACCESS_KEY") ??
-      readOptionalEnv("AWS_SECRET_ACCESS_KEY"),
+    webdavUsername: readOptionalEnv("WEBDAV_USERNAME"),
+    webdavPassword: readOptionalEnv("WEBDAV_PASSWORD"),
   };
-
-  if (!cachedConfig.s3Endpoint) {
-    throw new FacebookApiError(
-      "Thiếu R2 endpoint. Hãy cung cấp R2_ACCOUNT_ID hoặc R2_ENDPOINT.",
-      500
-    );
-  }
 
   return cachedConfig;
 }
@@ -98,21 +70,6 @@ function readRequiredEnv(variableName: string) {
   }
 
   return value;
-}
-
-function pickRequiredEnv(variableNames: string[]) {
-  for (const variableName of variableNames) {
-    const value = readOptionalEnv(variableName);
-
-    if (value) {
-      return value;
-    }
-  }
-
-  throw new FacebookApiError(
-    `Thiếu một trong các biến môi trường: ${variableNames.join(", ")}.`,
-    500
-  );
 }
 
 function readOptionalEnv(variableName: string) {

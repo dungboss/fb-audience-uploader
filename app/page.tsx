@@ -375,7 +375,7 @@ export default function Home() {
 
       setCreateProgress({
         step: "Đang xếp hàng xử lý...",
-        description: "Các shard đã ở R2, worker nền sẽ đồng bộ lần lượt lên Meta.",
+        description: "Các shard đã ở NAS temp, worker nền sẽ đồng bộ lần lượt lên Meta.",
         value: 64,
       });
 
@@ -465,7 +465,7 @@ export default function Home() {
 
       setUpdateProgress({
         step: "Đang xếp hàng xử lý...",
-        description: `Các shard đã ở R2, worker sẽ nạp dần vào audience ${selectedAudience.id}.`,
+        description: `Các shard đã ở NAS temp, worker sẽ nạp dần vào audience ${selectedAudience.id}.`,
         value: 64,
       });
 
@@ -1197,7 +1197,7 @@ async function uploadFileToJob({
       resolve(summary);
     };
 
-    const flushHashesToR2 = async (force: boolean) => {
+    const flushHashesToNas = async (force: boolean) => {
       while (
         pendingHashes.length >= CLIENT_UPLOAD_CHUNK_SIZE ||
         (force && pendingHashes.length > 0)
@@ -1207,8 +1207,8 @@ async function uploadFileToJob({
         const partNumber = totalParts + 1;
 
         setProgress({
-          step: "Đang tải shard lên R2...",
-          description: `Đang gửi shard ${formatNumber(partNumber)} với ${formatNumber(chunk.length)} hash lên R2.`,
+          step: "Đang tải shard lên NAS temp...",
+          description: `Đang gửi shard ${formatNumber(partNumber)} với ${formatNumber(chunk.length)} hash lên NAS temp.`,
           value: Math.min(60, 42 + Math.round(parseRatio * 18)),
         });
 
@@ -1245,12 +1245,12 @@ async function uploadFileToJob({
         pendingHashes.push(hash);
       }
 
-      await flushHashesToR2(false);
+      await flushHashesToNas(false);
     };
 
     const flushAll = async () => {
       await flushEmails();
-      await flushHashesToR2(true);
+      await flushHashesToNas(true);
 
       if (seenHashes.size === 0) {
         throw new Error("Không tìm thấy email hợp lệ trong file vừa tải lên.");
@@ -1415,7 +1415,7 @@ async function uploadAudienceJobPart(
     throw new Error(presignPayload.error || "Không thể presign shard upload.");
   }
 
-  const r2Response = await fetch(presignPayload.uploadUrl, {
+  const uploadResponse = await fetch(presignPayload.uploadUrl, {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
@@ -1423,8 +1423,8 @@ async function uploadAudienceJobPart(
     body: JSON.stringify(hashedEmails),
   });
 
-  if (!r2Response.ok) {
-    throw new Error("R2 từ chối shard upload hiện tại.");
+  if (!uploadResponse.ok) {
+    throw new Error("NAS temp từ chối shard upload hiện tại.");
   }
 
   const response = await fetch(`/api/upload-jobs/${jobId}/parts/complete`, {

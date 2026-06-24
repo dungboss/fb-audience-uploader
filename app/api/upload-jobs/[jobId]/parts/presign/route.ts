@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 
 import { getClientSafeError } from "@/app/api/audiences/meta";
 import { getAudienceUploadJob } from "@/lib/audience-upload/jobs";
-import { createShardUploadUrl } from "@/lib/audience-upload/s3";
+import { createShardUploadUrl } from "@/lib/audience-upload/storage";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -44,7 +44,7 @@ export async function POST(
   } catch (error) {
     const safeError = getClientSafeError(
       error,
-      "Không thể tạo presigned URL cho shard upload."
+      "Không thể tạo URL upload shard."
     );
 
     return NextResponse.json(

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 
 import { getClientSafeError } from "@/app/api/audiences/meta";
 import { recordAudienceUploadPart } from "@/lib/audience-upload/jobs";
-import { buildShardObjectKey } from "@/lib/audience-upload/s3";
+import { buildShardObjectKey } from "@/lib/audience-upload/storage";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -33,7 +33,7 @@ export async function POST(
     if (objectKey !== buildShardObjectKey(jobId, partIndex)) {
       return NextResponse.json(
         {
-          error: "Object key upload không khớp với shard được cấp presign.",
+          error: "Object key upload không khớp với shard được cấp.",
         },
         {
           status: 400,
