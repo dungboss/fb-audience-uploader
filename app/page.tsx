@@ -305,6 +305,7 @@ export default function Home() {
   async function handleCreateFileSelected(file: File) {
     setCreateFile(buildFileSelection(file, "local"));
     setCreateProgress(null);
+    setAudienceName(file.name.replace(/\.[^/.]+$/, ""));
   }
 
   async function handleUpdateFileSelected(file: File) {
@@ -332,6 +333,7 @@ export default function Home() {
     if (nasBrowseTarget === "create") {
       setCreateFile(selection);
       setCreateProgress(null);
+      setAudienceName(file.name.replace(/\.[^/.]+$/, ""));
       return;
     }
 
