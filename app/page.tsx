@@ -7,6 +7,7 @@ import Papa from "papaparse";
 import { toast } from "sonner";
 import {
   AlertCircle,
+  FolderOpen,
   Loader2,
   Plus,
   RefreshCcw,
@@ -48,6 +49,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
+import { NasFileBrowserDialog } from "@/components/nas-file-browser-dialog";
 import { cn } from "@/lib/utils";
 
 const DROPZONE_ACCEPT: Accept = {
@@ -87,7 +89,11 @@ type FileSelection = {
   file: File;
   fileName: string;
   fileSize: number;
+  source: "local" | "nas";
+  sourceLabel: string | null;
 };
+
+type NasBrowseTarget = "create" | "update";
 
 type UploadPipelineSummary = {
   totalParts: number;
@@ -170,6 +176,11 @@ export default function Home() {
   const [updateFile, setUpdateFile] = useState<FileSelection | null>(null);
   const [updateProgress, setUpdateProgress] = useState<ProgressState | null>(null);
   const [isUpdateSubmitting, setIsUpdateSubmitting] = useState(false);
+  const [nasBrowseTarget, setNasBrowseTarget] = useState<NasBrowseTarget | null>(
+    null
+  );
+  const [isNasBrowserOpen, setIsNasBrowserOpen] = useState(false);
+  const [nasBrowserPath, setNasBrowserPath] = useState("/");
 
   const [deleteTargets, setDeleteTargets] = useState<Audience[]>([]);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
@@ -277,21 +288,54 @@ export default function Home() {
     }
   }
 
-  async function handleCreateFileSelected(file: File) {
-    setCreateFile({
+  function buildFileSelection(
+    file: File,
+    source: FileSelection["source"],
+    sourceLabel: string | null = null
+  ): FileSelection {
+    return {
       file,
       fileName: file.name,
       fileSize: file.size,
-    });
+      source,
+      sourceLabel,
+    };
+  }
+
+  async function handleCreateFileSelected(file: File) {
+    setCreateFile(buildFileSelection(file, "local"));
     setCreateProgress(null);
   }
 
   async function handleUpdateFileSelected(file: File) {
-    setUpdateFile({
-      file,
-      fileName: file.name,
-      fileSize: file.size,
-    });
+    setUpdateFile(buildFileSelection(file, "local"));
+    setUpdateProgress(null);
+  }
+
+  function openNasBrowser(target: NasBrowseTarget) {
+    setNasBrowseTarget(target);
+    setIsNasBrowserOpen(true);
+  }
+
+  function closeNasBrowser() {
+    setIsNasBrowserOpen(false);
+    setNasBrowseTarget(null);
+  }
+
+  async function handleNasFileSelected(file: File, filePath: string) {
+    if (!nasBrowseTarget) {
+      throw new Error("Chưa xác định nơi nhận file từ NAS.");
+    }
+
+    const selection = buildFileSelection(file, "nas", filePath);
+
+    if (nasBrowseTarget === "create") {
+      setCreateFile(selection);
+      setCreateProgress(null);
+      return;
+    }
+
+    setUpdateFile(selection);
     setUpdateProgress(null);
   }
 
@@ -597,8 +641,9 @@ export default function Home() {
                   <UploadDropzone
                     variant="dense"
                     disabled={isCreateSubmitting}
-                    title="Kéo thả file CSV/TXT"
+                    title="Kéo thả file CSV/TXT hoặc chọn từ NAS"
                     selection={createFile}
+                    onBrowseNas={() => openNasBrowser("create")}
                     onFileSelected={handleCreateFileSelected}
                   />
 
@@ -844,8 +889,9 @@ export default function Home() {
             <UploadDropzone
               variant="compact"
               disabled={isUpdateSubmitting}
-              title="Kéo thả file CSV/TXT"
+              title="Kéo thả file CSV/TXT hoặc chọn từ NAS"
               selection={updateFile}
+              onBrowseNas={() => openNasBrowser("update")}
               onFileSelected={handleUpdateFileSelected}
             />
 
@@ -886,6 +932,17 @@ export default function Home() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <NasFileBrowserDialog
+        initialPath={nasBrowserPath}
+        isOpen={isNasBrowserOpen}
+        onClose={closeNasBrowser}
+        onCurrentPathChange={(path) => {
+          setNasBrowserPath(path);
+        }}
+        onSelectFile={handleNasFileSelected}
+        rootLabel="NAS"
+      />
 
       <AlertDialog
         open={isDeleteDialogOpen}
@@ -960,12 +1017,14 @@ export default function Home() {
 function UploadDropzone({
   disabled,
   title,
+  onBrowseNas,
   selection,
   variant = "default",
   onFileSelected,
 }: {
   disabled?: boolean;
   title: string;
+  onBrowseNas?: () => void;
   selection: FileSelection | null;
   variant?: "default" | "compact" | "dense";
   onFileSelected: (file: File) => Promise<void>;
@@ -1035,10 +1094,35 @@ function UploadDropzone({
       </div>
 
       {selection ? (
-        <div className="flex flex-wrap gap-2">
-          <Badge variant="outline">{selection.fileName}</Badge>
-          <Badge variant="secondary">{formatFileSize(selection.fileSize)}</Badge>
+        <div className="space-y-2">
+          <div className="flex flex-wrap gap-2">
+            <Badge variant="outline">{selection.fileName}</Badge>
+            <Badge variant="secondary">{formatFileSize(selection.fileSize)}</Badge>
+            <Badge
+              variant={selection.source === "nas" ? "warning" : "outline"}
+            >
+              {selection.source === "nas" ? "NAS" : "Local"}
+            </Badge>
+          </div>
+          {selection.sourceLabel ? (
+            <p className="break-all text-xs text-muted-foreground">
+              {selection.sourceLabel}
+            </p>
+          ) : null}
         </div>
+      ) : null}
+
+      {onBrowseNas ? (
+        <Button
+          type="button"
+          variant="outline"
+          onClick={onBrowseNas}
+          disabled={disabled}
+          className="w-full"
+        >
+          <FolderOpen className="size-4" />
+          Chọn file từ NAS
+        </Button>
       ) : null}
     </div>
   );

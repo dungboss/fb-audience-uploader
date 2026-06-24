@@ -1,0 +1,512 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import {
+  AlertCircle,
+  FileText,
+  Folder,
+  Loader2,
+  RefreshCcw,
+  Search,
+} from "lucide-react";
+import { toast } from "sonner";
+
+import { NasFolderTree } from "@/components/nas-folder-tree";
+import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import {
+  formatWebDavDate,
+  formatWebDavSize,
+  getWebDavEntryTypeLabel,
+  isSupportedWebDavUploadFile,
+  normalizeWebDavPath,
+  type WebDavDirectoryResponse,
+  type WebDavDirectoryEntry,
+} from "@/lib/webdav";
+import { useWebDavFolderTree } from "@/hooks/use-webdav-folder-tree";
+
+const WEBDAV_FILE_API_URL = "/api/webdav/file";
+
+type NasFileBrowserDialogProps = {
+  initialPath?: string;
+  isOpen: boolean;
+  onClose: () => void;
+  onCurrentPathChange?: (path: string) => void;
+  onSelectFile: (file: File, filePath: string) => Promise<void> | void;
+  rootLabel?: string;
+};
+
+function getErrorMessage(error: unknown, fallbackMessage: string) {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+
+  return fallbackMessage;
+}
+
+export function NasFileBrowserDialog({
+  initialPath,
+  isOpen,
+  onClose,
+  onCurrentPathChange,
+  onSelectFile,
+  rootLabel = "NAS",
+}: NasFileBrowserDialogProps) {
+  const {
+    breadcrumbs,
+    currentDirectory,
+    currentPath,
+    errorMessage: treeErrorMessage,
+    isCurrentDirectoryLoading,
+    isInitializing,
+    treeRows,
+    refreshCurrentDirectory,
+    selectPath,
+    toggleExpanded,
+  } = useWebDavFolderTree({
+    fetchDirectory: fetchWebDavDirectory,
+    initialPath,
+    isOpen,
+    rootLabel,
+  });
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  const [selectionErrorMessage, setSelectionErrorMessage] = useState<string | null>(null);
+  const [isSelectingFile, setIsSelectingFile] = useState(false);
+
+  useEffect(() => {
+    queueMicrotask(() => {
+      setSearchQuery("");
+      setSelectedFilePath(null);
+      setSelectionErrorMessage(null);
+      setIsSelectingFile(false);
+    });
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    onCurrentPathChange?.(currentPath);
+  }, [currentPath, isOpen, onCurrentPathChange]);
+
+  const combinedEntries = useMemo(() => {
+    const folders = currentDirectory?.folders ?? [];
+    const files = (currentDirectory?.files ?? []).filter(isSupportedWebDavUploadFile);
+    return [...folders, ...files];
+  }, [currentDirectory]);
+
+  const visibleEntries = useMemo(() => {
+    const normalizedQuery = searchQuery.trim().toLowerCase();
+
+    if (!normalizedQuery) {
+      return combinedEntries;
+    }
+
+    return combinedEntries.filter((entry) =>
+      entry.name.toLowerCase().includes(normalizedQuery)
+    );
+  }, [combinedEntries, searchQuery]);
+
+  const selectedFileEntry = useMemo(
+    () =>
+      combinedEntries.find(
+        (entry) => entry.path === selectedFilePath && !entry.isDirectory
+      ) ?? null,
+    [combinedEntries, selectedFilePath]
+  );
+
+  const combinedErrorMessage = treeErrorMessage || selectionErrorMessage;
+  const isBusy = isInitializing || isSelectingFile;
+
+  function handleNavigatePath(pathValue: string) {
+    setSelectedFilePath(null);
+    setSelectionErrorMessage(null);
+    selectPath(pathValue);
+  }
+
+  function handleSelectFile(entry: WebDavDirectoryEntry) {
+    if (entry.isDirectory || isBusy) {
+      return;
+    }
+
+    setSelectedFilePath(entry.path);
+    setSelectionErrorMessage(null);
+  }
+
+  async function handleConfirmSelection() {
+    if (!selectedFileEntry || isSelectingFile) {
+      return;
+    }
+
+    setIsSelectingFile(true);
+    setSelectionErrorMessage(null);
+    let shouldClose = false;
+
+    try {
+      const response = await fetch(
+        `${WEBDAV_FILE_API_URL}?path=${encodeURIComponent(
+          normalizeWebDavPath(selectedFileEntry.path)
+        )}`,
+        {
+          cache: "no-store",
+        }
+      );
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as {
+          error?: string;
+        };
+
+        throw new Error(payload.error || "Không thể tải file từ NAS.");
+      }
+
+      const blob = await response.blob();
+      const mimeType =
+        response.headers.get("content-type")?.split(";")[0]?.trim() ||
+        selectedFileEntry.mimeType ||
+        blob.type ||
+        "application/octet-stream";
+
+      const file = new File([blob], selectedFileEntry.name, {
+        type: mimeType,
+      });
+
+      await onSelectFile(file, selectedFileEntry.path);
+      shouldClose = true;
+    } catch (error) {
+      const message = getErrorMessage(error, "Không thể tải file từ NAS.");
+      setSelectionErrorMessage(message);
+      toast.error("Chọn file từ NAS thất bại.", {
+        description: message,
+      });
+    } finally {
+      setIsSelectingFile(false);
+    }
+
+    if (shouldClose) {
+      onClose();
+    }
+  }
+
+  return (
+    <Dialog
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open && !isSelectingFile) {
+          onClose();
+        }
+      }}
+      disablePointerDismissal={isSelectingFile}
+    >
+      <DialogContent
+        className="max-w-7xl overflow-hidden p-0"
+        showCloseButton={!isSelectingFile}
+      >
+        <div className="flex max-h-[90vh] flex-col">
+          <div className="border-b border-border/70 px-6 pt-6 pb-4 pr-12">
+            <DialogHeader className="pr-0">
+              <DialogTitle>Chọn file từ NAS</DialogTitle>
+              <DialogDescription>
+                Cột trái là cây folder, cột phải là nội dung của folder đang chọn. Chọn file CSV/TXT để đưa vào luồng upload hiện tại.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              {breadcrumbs.map((item, index) => (
+                <button
+                  key={item.path}
+                  type="button"
+                  className={cn(
+                    "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                    index === breadcrumbs.length - 1
+                      ? "border-sky-200 bg-sky-50 text-sky-800"
+                      : "border-border bg-background text-muted-foreground hover:border-sky-200 hover:text-foreground"
+                  )}
+                  onClick={() => handleNavigatePath(item.path)}
+                  disabled={isBusy}
+                  title={item.path}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex min-h-0 flex-1 overflow-hidden">
+            <aside className="flex min-h-0 w-[340px] shrink-0 flex-col border-r border-border/70 bg-slate-50/70">
+              <NasFolderTree
+                rows={treeRows}
+                isBusy={isBusy}
+                rootLabel={rootLabel}
+                onSelect={handleNavigatePath}
+                onToggle={toggleExpanded}
+              />
+            </aside>
+
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+              <div className="flex flex-col gap-3 border-b border-border/70 px-6 py-4 xl:flex-row xl:items-center xl:justify-between">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant="outline" className="font-mono">
+                    {currentPath}
+                  </Badge>
+                  <Badge variant="secondary">
+                    {currentDirectory
+                      ? `${currentDirectory.folders.length} folder${currentDirectory.folders.length === 1 ? "" : "s"}`
+                      : "NAS"}
+                  </Badge>
+                </div>
+
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void refreshCurrentDirectory()}
+                    disabled={isBusy || isCurrentDirectoryLoading}
+                  >
+                    <RefreshCcw className="size-4" />
+                    Làm mới
+                  </Button>
+
+                  <div className="relative w-full sm:min-w-72">
+                    <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={searchQuery}
+                      onChange={(event) => setSearchQuery(event.target.value)}
+                      className="pl-9"
+                      placeholder="Tìm theo tên file hoặc thư mục"
+                      disabled={isBusy}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {combinedErrorMessage ? (
+                <div className="flex gap-3 border-b border-amber-200 bg-amber-50 px-6 py-3 text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-200">
+                  <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                  <div className="space-y-1">
+                    <p className="font-medium">Không thể truy cập NAS</p>
+                    <p className="text-sm leading-6">{combinedErrorMessage}</p>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
+                <div className="overflow-hidden rounded-2xl border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow className="bg-muted/35">
+                        <TableHead>Tên</TableHead>
+                        <TableHead className="w-36">Kích thước</TableHead>
+                        <TableHead className="w-28">Loại</TableHead>
+                        <TableHead className="w-52">Cập nhật</TableHead>
+                        <TableHead className="w-28 text-right">Hành động</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {isCurrentDirectoryLoading && !currentDirectory ? (
+                        <TableRow>
+                          <TableCell colSpan={5} className="py-12">
+                            <div className="flex items-center justify-center gap-3 text-muted-foreground">
+                              <Loader2 className="size-4 animate-spin" />
+                              Đang đọc nội dung NAS...
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ) : visibleEntries.length === 0 ? (
+                        <TableRow>
+                          <TableCell colSpan={5} className="py-12">
+                            <div className="flex flex-col items-center gap-3 text-center">
+                              <div className="flex size-12 items-center justify-center rounded-2xl border bg-muted/40">
+                                <FileText className="size-5 text-muted-foreground" />
+                              </div>
+                              <div className="space-y-1">
+                                <p className="font-medium">
+                                  {searchQuery.trim()
+                                    ? "Không có mục nào khớp bộ lọc hiện tại."
+                                    : "Thư mục này chưa có file CSV/TXT phù hợp."}
+                                </p>
+                                <p className="text-sm text-muted-foreground">
+                                  {searchQuery.trim()
+                                    ? "Hãy thử đổi từ khóa hoặc chọn folder khác trong cây bên trái."
+                                    : "Hãy mở folder khác trên NAS để tìm file dữ liệu."}
+                                </p>
+                              </div>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ) : (
+                        visibleEntries.map((entry) => {
+                          const isSelected = selectedFileEntry?.path === entry.path;
+
+                          return (
+                            <TableRow
+                              key={entry.path}
+                              data-state={isSelected ? "selected" : undefined}
+                              className={cn(
+                                "transition-colors",
+                                isSelected && "bg-sky-50/70"
+                              )}
+                            >
+                              <TableCell className="align-top">
+                                <button
+                                  type="button"
+                                  className="flex min-w-0 items-center gap-3 rounded-lg text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sky-400/50"
+                                  onClick={() =>
+                                    entry.isDirectory
+                                      ? handleNavigatePath(entry.path)
+                                      : handleSelectFile(entry)
+                                  }
+                                  disabled={isBusy}
+                                >
+                                  <span
+                                    className={cn(
+                                      "inline-flex size-8 shrink-0 items-center justify-center rounded-lg",
+                                      entry.isDirectory
+                                        ? "bg-amber-100 text-amber-600"
+                                        : "bg-sky-100 text-sky-600"
+                                    )}
+                                  >
+                                    {entry.isDirectory ? (
+                                      <Folder className="size-4" fill="currentColor" />
+                                    ) : (
+                                      <FileText className="size-4" />
+                                    )}
+                                  </span>
+                                  <span className="min-w-0 truncate font-medium text-slate-900">
+                                    {entry.name}
+                                  </span>
+                                </button>
+                              </TableCell>
+                              <TableCell className="align-top text-muted-foreground">
+                                {entry.isDirectory ? "--" : formatWebDavSize(entry.size)}
+                              </TableCell>
+                              <TableCell className="align-top text-muted-foreground">
+                                {getWebDavEntryTypeLabel(entry)}
+                              </TableCell>
+                              <TableCell className="align-top text-muted-foreground">
+                                {formatWebDavDate(entry.lastModified)}
+                              </TableCell>
+                              <TableCell className="align-top text-right">
+                                {entry.isDirectory ? (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => handleNavigatePath(entry.path)}
+                                    disabled={isBusy}
+                                  >
+                                    Mở
+                                  </Button>
+                                ) : (
+                                  <Button
+                                    type="button"
+                                    variant={isSelected ? "secondary" : "outline"}
+                                    size="sm"
+                                    onClick={() => handleSelectFile(entry)}
+                                    disabled={isBusy}
+                                  >
+                                    Chọn
+                                  </Button>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })
+                      )}
+                    </TableBody>
+                  </Table>
+                </div>
+
+                {selectedFileEntry ? (
+                  <div className="mt-4 rounded-2xl border bg-sky-50/60 p-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="warning">Đã chọn file</Badge>
+                      <Badge variant="outline" className="font-mono">
+                        {selectedFileEntry.name}
+                      </Badge>
+                      <Badge variant="secondary">
+                        {formatWebDavSize(selectedFileEntry.size)}
+                      </Badge>
+                    </div>
+                    <p className="mt-2 break-all text-sm text-muted-foreground">
+                      {selectedFileEntry.path}
+                    </p>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter className="border-t border-border/70 px-6 py-4">
+            <div className="flex w-full flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={onClose}
+                disabled={isSelectingFile}
+              >
+                Hủy
+              </Button>
+              <Button
+                type="button"
+                onClick={() => void handleConfirmSelection()}
+                disabled={!selectedFileEntry || isCurrentDirectoryLoading || isSelectingFile}
+              >
+                {isSelectingFile ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Đang tải...
+                  </>
+                ) : (
+                  <>
+                    <FileText className="size-4" />
+                    Chọn file
+                  </>
+                )}
+              </Button>
+            </div>
+          </DialogFooter>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+async function fetchWebDavDirectory(pathValue: string) {
+  const response = await fetch(
+    `/api/webdav/entries?path=${encodeURIComponent(normalizeWebDavPath(pathValue))}`,
+    {
+      cache: "no-store",
+    }
+  );
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as {
+      error?: string;
+    };
+
+    throw new Error(payload.error || "Không thể đọc thư mục NAS.");
+  }
+
+  return (await response.json()) as WebDavDirectoryResponse;
+}
