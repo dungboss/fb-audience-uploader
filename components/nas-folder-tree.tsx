@@ -49,16 +49,6 @@ export function NasFolderTree({
       tabIndex={0}
       onKeyDown={handleKeyDown}
     >
-      <div className="mb-3 rounded-2xl border bg-white/80 px-4 py-3 shadow-sm">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-          Folder Tree
-        </p>
-        <p className="mt-1 text-sm font-medium text-slate-900">{rootLabel}</p>
-        <p className="mt-1 text-xs leading-5 text-slate-500">
-          Chọn folder ở bên trái để mở nội dung tương ứng ở cột bên phải.
-        </p>
-      </div>
-
       {isBusy && rows.length === 0 ? (
         <div className="flex min-h-[220px] items-center justify-center rounded-2xl border border-dashed border-slate-200 bg-white/70 text-sm text-slate-500">
           <span className="inline-flex items-center gap-2">

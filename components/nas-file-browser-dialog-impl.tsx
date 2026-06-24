@@ -226,9 +226,7 @@ export function NasFileBrowserDialog({
           <div className="border-b border-border/70 px-6 pt-6 pb-4 pr-12">
             <DialogHeader className="pr-0">
               <DialogTitle>Chọn file từ NAS</DialogTitle>
-              <DialogDescription>
-                Cột trái là cây folder, cột phải là nội dung của folder đang chọn. Chọn file CSV/TXT để đưa vào luồng upload hiện tại.
-              </DialogDescription>
+              <DialogDescription />
             </DialogHeader>
 
             <div className="mt-4 flex flex-wrap items-center gap-2">
