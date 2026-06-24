@@ -317,13 +317,12 @@ export function NasFileBrowserDialog({
                         <TableHead className="w-36">Kích thước</TableHead>
                         <TableHead className="w-28">Loại</TableHead>
                         <TableHead className="w-52">Cập nhật</TableHead>
-                        <TableHead className="w-28 text-right">Hành động</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
                       {isCurrentDirectoryLoading && !currentDirectory ? (
                         <TableRow>
-                          <TableCell colSpan={5} className="py-12">
+                          <TableCell colSpan={4} className="py-12">
                             <div className="flex items-center justify-center gap-3 text-muted-foreground">
                               <Loader2 className="size-4 animate-spin" />
                               Đang đọc nội dung NAS...
@@ -332,7 +331,7 @@ export function NasFileBrowserDialog({
                         </TableRow>
                       ) : visibleEntries.length === 0 ? (
                         <TableRow>
-                          <TableCell colSpan={5} className="py-12">
+                          <TableCell colSpan={4} className="py-12">
                             <div className="flex flex-col items-center gap-3 text-center">
                               <div className="flex size-12 items-center justify-center rounded-2xl border bg-muted/40">
                                 <FileText className="size-5 text-muted-foreground" />
@@ -361,21 +360,17 @@ export function NasFileBrowserDialog({
                               key={entry.path}
                               data-state={isSelected ? "selected" : undefined}
                               className={cn(
-                                "transition-colors",
+                                "cursor-pointer transition-colors hover:bg-sky-50/40",
                                 isSelected && "bg-sky-50/70"
                               )}
+                              onClick={() =>
+                                entry.isDirectory
+                                  ? handleNavigatePath(entry.path)
+                                  : handleSelectFile(entry)
+                              }
                             >
                               <TableCell className="align-top">
-                                <button
-                                  type="button"
-                                  className="flex min-w-0 items-center gap-3 rounded-lg text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sky-400/50"
-                                  onClick={() =>
-                                    entry.isDirectory
-                                      ? handleNavigatePath(entry.path)
-                                      : handleSelectFile(entry)
-                                  }
-                                  disabled={isBusy}
-                                >
+                                <span className="flex min-w-0 items-center gap-3">
                                   <span
                                     className={cn(
                                       "inline-flex size-8 shrink-0 items-center justify-center rounded-lg",
@@ -393,7 +388,7 @@ export function NasFileBrowserDialog({
                                   <span className="min-w-0 truncate font-medium text-slate-900">
                                     {entry.name}
                                   </span>
-                                </button>
+                                </span>
                               </TableCell>
                               <TableCell className="align-top text-muted-foreground">
                                 {entry.isDirectory ? "--" : formatWebDavSize(entry.size)}
@@ -404,29 +399,7 @@ export function NasFileBrowserDialog({
                               <TableCell className="align-top text-muted-foreground">
                                 {formatWebDavDate(entry.lastModified)}
                               </TableCell>
-                              <TableCell className="align-top text-right">
-                                {entry.isDirectory ? (
-                                  <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => handleNavigatePath(entry.path)}
-                                    disabled={isBusy}
-                                  >
-                                    Mở
-                                  </Button>
-                                ) : (
-                                  <Button
-                                    type="button"
-                                    variant={isSelected ? "secondary" : "outline"}
-                                    size="sm"
-                                    onClick={() => handleSelectFile(entry)}
-                                    disabled={isBusy}
-                                  >
-                                    Chọn
-                                  </Button>
-                                )}
-                              </TableCell>
+                              <TableCell className="align-top text-right" />
                             </TableRow>
                           );
                         })
