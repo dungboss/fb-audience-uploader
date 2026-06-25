@@ -1,9 +1,10 @@
 "use client";
 
-import { startTransition, useDeferredValue, useEffect, useState } from "react";
+import { startTransition, useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   AlertCircle,
+  Eye,
   FolderOpen,
   Loader2,
   Plus,
@@ -48,8 +49,9 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { NasFileBrowserDialog } from "@/components/nas-file-browser-dialog";
 
-const JOB_POLL_DELAY_MS = 250;
 const numberFormatter = new Intl.NumberFormat("vi-VN");
+
+const ACTIVE_JOB_STORAGE_KEY = "audience-upload:active-job-id";
 
 type AudienceAvailability = "ready" | "populating";
 type AudienceJobKind = "create" | "append";
@@ -153,6 +155,14 @@ export default function Home() {
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
+  const [recentJobs, setRecentJobs] = useState<AudienceUploadJob[]>([]);
+  const [resumedJobId, setResumedJobId] = useState<string | null>(null);
+  const [resumedJobProgress, setResumedJobProgress] = useState<ProgressState | null>(null);
+  const [isLoadingRecentJobs, setIsLoadingRecentJobs] = useState(false);
+  const activeJobs = recentJobs.filter(
+    (j) => j.status === "queued" || j.status === "processing"
+  );
+
   const selectedIdSet = new Set(selectedIds);
   const normalizedSearchQuery = deferredSearchQuery.trim().toLowerCase();
   const filteredAudiences = audiences.filter((audience) => {
@@ -184,6 +194,68 @@ export default function Home() {
     });
   }
 
+  // --- Watch a job via SSE (EventSource) until completion or failure ---
+  function watchJobViaSSE(
+    jobId: string,
+    setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>
+  ): Promise<AudienceUploadJob> {
+    return new Promise((resolve, reject) => {
+      const eventSource = new EventSource(`/api/upload-jobs/${jobId}/stream`);
+
+      eventSource.onmessage = (event) => {
+        try {
+          const job: AudienceUploadJob = JSON.parse(event.data);
+
+          if ("error" in job && typeof (job as unknown as { error: string }).error === "string") {
+            const err = job as unknown as { error: string };
+            eventSource.close();
+            reject(new Error(err.error));
+            return;
+          }
+
+          setProgress(buildJobSyncProgress(job));
+
+          if (job.status === "completed") {
+            eventSource.close();
+            resolve(job);
+          } else if (job.status === "failed") {
+            eventSource.close();
+            reject(new Error(job.errorMessage || "Meta từ chối job upload hiện tại."));
+          }
+        } catch {
+          // Malformed SSE data — ignore and wait for next message
+        }
+      };
+
+      eventSource.onerror = () => {
+        eventSource.close();
+        reject(new Error("Kết nối theo dõi job bị gián đoạn. Job vẫn đang chạy trên server."));
+      };
+    });
+  }
+
+  // --- LocalStorage helpers ---
+  function setActiveJobId(jobId: string | null) {
+    try {
+      if (jobId) {
+        window.localStorage.setItem(ACTIVE_JOB_STORAGE_KEY, jobId);
+      } else {
+        window.localStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
+      }
+    } catch {
+      // localStorage may be unavailable
+    }
+  }
+
+  function getActiveJobId(): string | null {
+    try {
+      return window.localStorage.getItem(ACTIVE_JOB_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  // --- Bootstrap: load audiences ---
   useEffect(() => {
     let isCancelled = false;
 
@@ -223,6 +295,111 @@ export default function Home() {
       isCancelled = true;
     };
   }, []);
+
+  // --- Mount: restore active job via SSE + recent jobs list ---
+  useEffect(() => {
+    let isCancelled = false;
+
+    void (async () => {
+      setIsLoadingRecentJobs(true);
+
+      try {
+        const jobs = await fetchRecentJobsFromApi();
+        if (isCancelled) return;
+        setRecentJobs(jobs);
+
+        // Auto-restore any active job (queued/processing) from the API —
+        // works across browsers, machines, and after tab close/reopen.
+        const activeJob = jobs.find(
+          (j) => j.status === "queued" || j.status === "processing"
+        );
+
+        if (activeJob) {
+          // Persist for same-browser restore on quick reconnects
+          setActiveJobId(activeJob.id);
+          setResumedJobId(activeJob.id);
+          setResumedJobProgress(buildJobSyncProgress(activeJob));
+
+          try {
+            await watchJobViaSSE(activeJob.id, (progress) => {
+              if (!isCancelled) setResumedJobProgress(progress);
+            });
+
+            if (!isCancelled) {
+              await refreshAudiences({ silent: true });
+              dismissProgressLater(setResumedJobProgress, 2800);
+              toast.success("Job khôi phục đã hoàn tất.", {
+                description: `Job ${activeJob.name || activeJob.fileName} đã đồng bộ xong.`,
+              });
+              setActiveJobId(null);
+              fetchRecentJobsFromApi().then((nextJobs) => {
+                if (!isCancelled) setRecentJobs(nextJobs);
+              });
+            }
+          } catch {
+            if (!isCancelled) {
+              dismissProgressLater(setResumedJobProgress, 3200);
+              toast.error("Job khôi phục thất bại.");
+              setActiveJobId(null);
+              fetchRecentJobsFromApi().then((nextJobs) => {
+                if (!isCancelled) setRecentJobs(nextJobs);
+              });
+            }
+          } finally {
+            if (!isCancelled) setResumedJobId(null);
+          }
+        } else {
+          // Clean up stale localStorage if job no longer active
+          setActiveJobId(null);
+        }
+      } catch {
+        // Silently ignore — recent jobs is non-critical
+      } finally {
+        if (!isCancelled) setIsLoadingRecentJobs(false);
+      }
+    })();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  // --- Resume a job manually from the recent jobs list ---
+  async function resumeJob(jobId: string) {
+    setResumedJobId(jobId);
+
+    try {
+      const initial = await fetchJobById(jobId);
+      setResumedJobProgress(buildJobSyncProgress(initial));
+
+      if (initial.status === "completed" || initial.status === "failed") {
+        dismissProgressLater(setResumedJobProgress, 2800);
+        setResumedJobId(null);
+        fetchRecentJobsFromApi().then(setRecentJobs);
+        return;
+      }
+
+      setActiveJobId(jobId);
+      await watchJobViaSSE(jobId, (progress) => {
+        setResumedJobProgress(progress);
+      });
+
+      await refreshAudiences({ silent: true });
+      dismissProgressLater(setResumedJobProgress, 2800);
+      toast.success("Job đã hoàn tất.", {
+        description: `Job ${initial.name || initial.fileName} đã đồng bộ xong.`,
+      });
+      setActiveJobId(null);
+      fetchRecentJobsFromApi().then(setRecentJobs);
+    } catch {
+      dismissProgressLater(setResumedJobProgress, 3200);
+      toast.error("Job thất bại hoặc bị gián đoạn.");
+      setActiveJobId(null);
+      fetchRecentJobsFromApi().then(setRecentJobs);
+    } finally {
+      setResumedJobId(null);
+    }
+  }
 
   async function refreshAudiences(options?: { silent?: boolean }) {
     const isSilent = options?.silent ?? false;
@@ -322,10 +499,9 @@ export default function Home() {
         value: 12,
       });
 
-      const completedJob = await runAudienceJobUntilComplete(
-        job.id,
-        setCreateProgress
-      );
+      setActiveJobId(job.id);
+
+      const completedJob = await watchJobViaSSE(job.id, setCreateProgress);
 
       await refreshAudiences({ silent: true });
       setCreateProgress({
@@ -338,6 +514,7 @@ export default function Home() {
         description: `${formatNumber(completedJob.syncedHashCount)} hash đã được đồng bộ lên Meta.`,
       });
 
+      setActiveJobId(null);
       setAudienceName(generateAudienceName());
       setDescription("");
       setCreateFile(null);
@@ -399,10 +576,9 @@ export default function Home() {
         value: 12,
       });
 
-      const completedJob = await runAudienceJobUntilComplete(
-        job.id,
-        setUpdateProgress
-      );
+      setActiveJobId(job.id);
+
+      const completedJob = await watchJobViaSSE(job.id, setUpdateProgress);
 
       await refreshAudiences({ silent: true });
       setUpdateProgress({
@@ -415,6 +591,7 @@ export default function Home() {
         description: `${formatNumber(completedJob.syncedHashCount)} hash đã được gửi lên Meta.`,
       });
 
+      setActiveJobId(null);
       dismissProgressLater(setUpdateProgress);
       setUpdateFile(null);
       setIsAddUsersDialogOpen(false);
@@ -594,6 +771,142 @@ export default function Home() {
               <ProgressPanel progress={createProgress} />
             </CardContent>
           </Card>
+
+          {activeJobs.length > 0 || resumedJobProgress ? (
+            <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
+              <CardHeader className="pb-3">
+                <CardTitle className="flex items-center gap-2">
+                  Đang tải lên
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setIsLoadingRecentJobs(true);
+                      fetchRecentJobsFromApi()
+                        .then(setRecentJobs)
+                        .finally(() => setIsLoadingRecentJobs(false));
+                    }}
+                    disabled={isLoadingRecentJobs}
+                  >
+                    {isLoadingRecentJobs ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <RefreshCcw className="size-4" />
+                    )}
+                  </Button>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {resumedJobProgress ? (
+                  <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4">
+                    <p className="mb-2 text-sm font-medium text-sky-800">
+                      🔄 Đang theo dõi job {resumedJobId ? `(${resumedJobId.slice(0, 8)}...)` : ""}
+                    </p>
+                    <ProgressPanel progress={resumedJobProgress} />
+                  </div>
+                ) : null}
+                {isLoadingRecentJobs && activeJobs.length === 0 ? (
+                  <div className="flex items-center justify-center gap-3 py-8 text-muted-foreground">
+                    <Loader2 className="size-4 animate-spin" />
+                    Đang tải...
+                  </div>
+                ) : (
+                  <div className="overflow-hidden rounded-2xl border">
+                    <Table>
+                      <TableHeader>
+                        <TableRow className="bg-muted/35">
+                          <TableHead>Tên / File</TableHead>
+                          <TableHead>Loại</TableHead>
+                          <TableHead>Trạng thái</TableHead>
+                          <TableHead>Tiến độ</TableHead>
+                          <TableHead>Thời gian</TableHead>
+                          <TableHead className="text-right">Theo dõi</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {activeJobs.map((job) => (
+                          <TableRow key={job.id}>
+                            <TableCell>
+                              <div className="space-y-1">
+                                <p className="text-sm font-medium">
+                                  {job.name || job.fileName}
+                                </p>
+                                <p className="max-w-80 truncate text-xs text-muted-foreground">
+                                  {job.nasFilePath}
+                                </p>
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="outline">
+                                {job.kind === "create" ? "Tạo mới" : "Nạp thêm"}
+                              </Badge>
+                            </TableCell>
+                            <TableCell>
+                              <JobStatusBadge status={job.status} />
+                            </TableCell>
+                            <TableCell>
+                              {job.status === "processing" ? (
+                                <div className="max-w-32">
+                                  <Progress
+                                    value={
+                                      job.totalBytes && job.totalBytes > 0
+                                        ? Math.round(
+                                            (job.processedBytes / job.totalBytes) * 100
+                                          )
+                                        : 0
+                                    }
+                                    className="h-1.5"
+                                  />
+                                  <span className="mt-1 block text-xs tabular-nums text-muted-foreground">
+                                    {job.processedBytes > 0
+                                      ? formatFileSize(job.processedBytes)
+                                      : "..."}
+                                    {job.totalBytes
+                                      ? ` / ${formatFileSize(job.totalBytes)}`
+                                      : ""}
+                                  </span>
+                                </div>
+                              ) : null}
+                              {job.status === "queued" ? (
+                                <span className="text-xs text-muted-foreground">
+                                  Đang chờ...
+                                </span>
+                              ) : null}
+                            </TableCell>
+                            <TableCell className="text-xs text-muted-foreground">
+                              {new Date(job.createdAt).toLocaleString("vi-VN")}
+                            </TableCell>
+                            <TableCell className="text-right">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => resumeJob(job.id)}
+                                disabled={resumedJobId === job.id}
+                              >
+                                {resumedJobId === job.id ? (
+                                  <>
+                                    <Loader2 className="size-3.5 animate-spin" />
+                                    Đang theo dõi
+                                  </>
+                                ) : (
+                                  <>
+                                    <Eye className="size-3.5" />
+                                    Theo dõi
+                                  </>
+                                )}
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          ) : null}
 
           <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
             <CardHeader className="gap-4">
@@ -779,6 +1092,7 @@ export default function Home() {
               </div>
             </CardContent>
           </Card>
+
         </main>
       </div>
 
@@ -1016,6 +1330,21 @@ function AvailabilityBadge({
   return <Badge variant="warning">Populating</Badge>;
 }
 
+function JobStatusBadge({ status }: { status: AudienceJobStatus }) {
+  switch (status) {
+    case "completed":
+      return <Badge variant="success">Hoàn tất</Badge>;
+    case "failed":
+      return <Badge variant="destructive">Thất bại</Badge>;
+    case "processing":
+      return <Badge variant="success" className="animate-pulse">Đang xử lý</Badge>;
+    case "queued":
+      return <Badge variant="warning">Đang chờ</Badge>;
+    default:
+      return <Badge variant="outline">Nháp</Badge>;
+  }
+}
+
 async function createAudienceJob(input: {
   kind: AudienceJobKind;
   nasFilePath: string;
@@ -1039,33 +1368,17 @@ async function createAudienceJob(input: {
   return payload.job;
 }
 
-async function runAudienceJobUntilComplete(
-  jobId: string,
-  setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>
-) {
-  while (true) {
-    const response = await fetch(`/api/upload-jobs/${jobId}`, {
-      cache: "no-store",
-    });
-    const payload = await readJsonSafe<AudienceJobResponse>(response);
+async function fetchJobById(jobId: string) {
+  const response = await fetch(`/api/upload-jobs/${jobId}`, {
+    cache: "no-store",
+  });
+  const payload = await readJsonSafe<AudienceJobResponse>(response);
 
-    if (!response.ok || !payload.job) {
-      throw new Error(payload.error || "Không thể xử lý upload job.");
-    }
-
-    const job = payload.job;
-    setProgress(buildJobSyncProgress(job));
-
-    if (job.status === "completed") {
-      return job;
-    }
-
-    if (job.status === "failed") {
-      throw new Error(job.errorMessage || "Meta từ chối job upload hiện tại.");
-    }
-
-    await waitFor(JOB_POLL_DELAY_MS);
+  if (!response.ok || !payload.job) {
+    throw new Error(payload.error || "Không thể tìm thấy upload job.");
   }
+
+  return payload.job;
 }
 
 function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
@@ -1109,6 +1422,19 @@ function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
         : "Worker đang đọc file từ NAS...",
     value: percent,
   };
+}
+
+async function fetchRecentJobsFromApi() {
+  const response = await fetch("/api/upload-jobs", {
+    cache: "no-store",
+  });
+  const payload = await readJsonSafe<{ jobs?: AudienceUploadJob[]; error?: string }>(response);
+
+  if (!response.ok) {
+    throw new Error(payload.error || "Không thể tải danh sách upload jobs.");
+  }
+
+  return payload.jobs ?? [];
 }
 
 async function fetchAudiencesFromApi() {
@@ -1196,10 +1522,4 @@ function dismissProgressLater(
   window.setTimeout(() => {
     setProgress(null);
   }, delay);
-}
-
-function waitFor(delayMs: number) {
-  return new Promise<void>((resolve) => {
-    window.setTimeout(resolve, delayMs);
-  });
 }

@@ -1,12 +1,35 @@
 import { NextResponse } from "next/server";
 
 import { getClientSafeError } from "@/app/api/audiences/meta";
-import { createAudienceUploadJob } from "@/lib/audience-upload/jobs";
+import { createAudienceUploadJob, listRecentAudienceUploadJobs } from "@/lib/audience-upload/jobs";
 import { enqueueAudienceUploadJob } from "@/lib/audience-upload/queue";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 60;
+
+export async function GET() {
+  try {
+    const jobs = await listRecentAudienceUploadJobs();
+
+    return NextResponse.json({ jobs });
+  } catch (error) {
+    const safeError = getClientSafeError(
+      error,
+      "Không thể tải danh sách upload jobs."
+    );
+
+    return NextResponse.json(
+      {
+        error: safeError.message,
+        details: safeError.details,
+      },
+      {
+        status: safeError.status,
+      }
+    );
+  }
+}
 
 export async function POST(request: Request) {
   try {

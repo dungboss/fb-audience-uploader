@@ -11,6 +11,9 @@ import type {
 } from "./types";
 
 const JOB_KEY_PREFIX = "audience-upload:job:";
+const JOB_INDEX_KEY = "audience-upload:job-index";
+const RECENT_JOBS_KEY = "audience-upload:recent-jobs";
+const MAX_RECENT_JOBS = 20;
 
 export async function createAudienceUploadJob(input: {
   kind: AudienceUploadJobKind;
@@ -64,6 +67,7 @@ export async function createAudienceUploadJob(input: {
 
   await persistJob(job);
   await refreshJobExpiry(jobId);
+  await pushToRecentJobs(jobId);
 
   return job;
 }
@@ -214,4 +218,34 @@ function parseEnum<T extends string>(
   }
 
   return fallback;
+}
+
+async function pushToRecentJobs(jobId: string) {
+  await getRedis().lpush(RECENT_JOBS_KEY, jobId);
+  await getRedis().ltrim(RECENT_JOBS_KEY, 0, MAX_RECENT_JOBS - 1);
+}
+
+export async function listRecentAudienceUploadJobs() {
+  const jobIds = await getRedis().lrange(RECENT_JOBS_KEY, 0, -1);
+
+  if (jobIds.length === 0) {
+    return [];
+  }
+
+  const pipeline = getRedis().pipeline();
+  for (const id of jobIds) {
+    pipeline.hgetall(getJobKey(id));
+  }
+
+  const results = (await pipeline.exec()) as [Error | null, Record<string, string>][];
+
+  return results
+    .map(([error, payload], index) => {
+      if (error || !payload || Object.keys(payload).length === 0) {
+        return null;
+      }
+
+      return parseJobPayload(jobIds[index], payload);
+    })
+    .filter((job): job is AudienceUploadJob => job !== null);
 }
