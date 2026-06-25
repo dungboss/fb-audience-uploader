@@ -990,10 +990,16 @@ function ProgressPanel({ progress }: { progress: ProgressState | null }) {
 
   return (
     <div className="rounded-2xl border bg-muted/30 p-4">
-      <div className="space-y-1">
-        <p className="font-medium">{progress.step}</p>
-        <p className="text-sm text-muted-foreground">{progress.description}</p>
+      <div className="mb-3 flex items-start justify-between gap-4">
+        <div className="space-y-1">
+          <p className="font-medium">{progress.step}</p>
+          <p className="text-sm text-muted-foreground">{progress.description}</p>
+        </div>
+        <span className="text-sm font-semibold tabular-nums text-muted-foreground">
+          {progress.value}%
+        </span>
       </div>
+      <Progress value={progress.value} className="gap-0" />
     </div>
   );
 }
@@ -1084,12 +1090,16 @@ function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
     return {
       step: "Hoàn tất",
       description: `Đã upload ${totalMb} lên Facebook.`,
-      value: 0,
+      value: 100,
     };
   }
 
   const processedMb = formatFileSize(job.processedBytes);
   const totalMb = job.totalBytes ? formatFileSize(job.totalBytes) : "?";
+  const percent =
+    job.totalBytes && job.totalBytes > 0
+      ? Math.round((job.processedBytes / job.totalBytes) * 100)
+      : 0;
 
   return {
     step: "Đang đồng bộ dữ liệu...",
@@ -1097,7 +1107,7 @@ function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
       job.processedBytes > 0
         ? `Đã upload ${processedMb} / ${totalMb} lên Facebook`
         : "Worker đang đọc file từ NAS...",
-    value: 0,
+    value: percent,
   };
 }
 
