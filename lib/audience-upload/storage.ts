@@ -20,9 +20,14 @@ export async function getNasFileMeta(
   };
 }
 
+export interface StreamChunk {
+  hashes: string[];
+  bytesRead: number;
+}
+
 export async function* streamNasFileLines(
   nasFilePath: string
-): AsyncGenerator<string[], void, void> {
+): AsyncGenerator<StreamChunk, void, void> {
   const head = await fetchWebDavFileHead(nasFilePath);
 
   if (head.contentLength === null) {
@@ -39,6 +44,7 @@ export async function* streamNasFileLines(
   while (offset < totalBytes) {
     const end = Math.min(offset + NAS_CHUNK_BYTES - 1, totalBytes - 1);
     const buffer = await fetchWebDavFileRange(nasFilePath, offset, end);
+    const chunkBytes = buffer.byteLength;
 
     let chunk = new TextDecoder("utf-8", { fatal: false }).decode(buffer);
 
@@ -69,7 +75,7 @@ export async function* streamNasFileLines(
       }
 
       if (hashes.length > 0) {
-        yield hashes;
+        yield { hashes, bytesRead: chunkBytes };
       }
     }
   }
@@ -78,7 +84,7 @@ export async function* streamNasFileLines(
   if (leftover.trim().length > 0) {
     const normalized = normalizeLineValue(leftover.trim());
     const hash = createHash("sha256").update(normalized).digest("hex");
-    yield [hash];
+    yield { hashes: [hash], bytesRead: 0 };
   }
 }
 

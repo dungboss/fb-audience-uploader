@@ -50,18 +50,14 @@ export async function createAudienceUploadJob(input: {
     nasFilePath,
     fileName,
     audienceId: kind === "append" ? audienceId : null,
-    receivedHashCount: 0,
     syncedHashCount: 0,
     syncedLines: 0,
     processedLines: 0,
+    processedBytes: 0,
     totalLines: null,
     totalBytes: null,
-    duplicateCount: 0,
-    invalidEntryCount: 0,
     lastSessionId: null,
     errorMessage: null,
-    finalizedAt: null,
-    completedAt: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -96,15 +92,13 @@ export async function patchAudienceUploadJob(
       | "status"
       | "audienceId"
       | "processedLines"
+      | "processedBytes"
       | "totalLines"
       | "totalBytes"
       | "syncedHashCount"
       | "syncedLines"
-      | "invalidEntryCount"
       | "lastSessionId"
       | "errorMessage"
-      | "finalizedAt"
-      | "completedAt"
       | "updatedAt"
     >
   >
@@ -122,12 +116,9 @@ export async function patchAudienceUploadJob(
 }
 
 export async function markAudienceUploadJobCompleted(jobId: string) {
-  const now = new Date().toISOString();
-
   await getRedis().hset(getJobKey(jobId), {
     status: "completed",
-    completedAt: now,
-    updatedAt: now,
+    updatedAt: new Date().toISOString(),
   });
   await refreshJobExpiry(jobId);
 
@@ -138,12 +129,10 @@ export async function markAudienceUploadJobFailed(
   jobId: string,
   errorMessage: string
 ) {
-  const now = new Date().toISOString();
-
   await getRedis().hset(getJobKey(jobId), {
     status: "failed",
     errorMessage,
-    updatedAt: now,
+    updatedAt: new Date().toISOString(),
   });
   await refreshJobExpiry(jobId);
 
@@ -173,18 +162,14 @@ function parseJobPayload(jobId: string, payload: Record<string, string>) {
     nasFilePath: payload.nasFilePath ?? "",
     fileName: payload.fileName ?? "",
     audienceId: payload.audienceId || null,
-    receivedHashCount: parseInteger(payload.receivedHashCount),
     syncedHashCount: parseInteger(payload.syncedHashCount),
     syncedLines: parseInteger(payload.syncedLines),
     processedLines: parseInteger(payload.processedLines),
+    processedBytes: parseInteger(payload.processedBytes),
     totalLines: parseNullableInteger(payload.totalLines),
     totalBytes: parseNullableInteger(payload.totalBytes),
-    duplicateCount: parseInteger(payload.duplicateCount),
-    invalidEntryCount: parseInteger(payload.invalidEntryCount),
     lastSessionId: payload.lastSessionId || null,
     errorMessage: payload.errorMessage || null,
-    finalizedAt: payload.finalizedAt || null,
-    completedAt: payload.completedAt || null,
     createdAt: payload.createdAt ?? new Date(0).toISOString(),
     updatedAt: payload.updatedAt ?? new Date(0).toISOString(),
   } satisfies AudienceUploadJob;

@@ -94,18 +94,14 @@ type AudienceUploadJob = {
   nasFilePath: string;
   fileName: string;
   audienceId: string | null;
-  receivedHashCount: number;
   syncedHashCount: number;
   syncedLines: number;
   processedLines: number;
+  processedBytes: number;
   totalLines: number | null;
   totalBytes: number | null;
-  duplicateCount: number;
-  invalidEntryCount: number;
   lastSessionId: string | null;
   errorMessage: string | null;
-  finalizedAt: string | null;
-  completedAt: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -994,16 +990,10 @@ function ProgressPanel({ progress }: { progress: ProgressState | null }) {
 
   return (
     <div className="rounded-2xl border bg-muted/30 p-4">
-      <div className="mb-3 flex items-start justify-between gap-4">
-        <div className="space-y-1">
-          <p className="font-medium">{progress.step}</p>
-          <p className="text-sm text-muted-foreground">{progress.description}</p>
-        </div>
-        <span className="text-sm font-semibold tabular-nums text-muted-foreground">
-          {progress.value}%
-        </span>
+      <div className="space-y-1">
+        <p className="font-medium">{progress.step}</p>
+        <p className="text-sm text-muted-foreground">{progress.description}</p>
       </div>
-      <Progress value={progress.value} className="gap-0" />
     </div>
   );
 }
@@ -1077,7 +1067,7 @@ function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
     return {
       step: "Đang chờ worker xử lý...",
       description: "BullMQ đã nhận job và đang chờ lượt đồng bộ lên Meta.",
-      value: 14,
+      value: 0,
     };
   }
 
@@ -1085,30 +1075,29 @@ function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
     return {
       step: "Đang khởi tạo đối tượng trên Meta...",
       description: "Worker đang tạo audience trống trước khi nạp dữ liệu.",
-      value: 18,
+      value: 0,
     };
   }
 
-  const processedLines = job.processedLines;
-  const syncedLines = job.syncedLines || 0;
+  if (job.status === "completed") {
+    const totalMb = job.totalBytes ? formatFileSize(job.totalBytes) : "?";
+    return {
+      step: "Hoàn tất",
+      description: `Đã upload ${totalMb} lên Facebook.`,
+      value: 0,
+    };
+  }
+
+  const processedMb = formatFileSize(job.processedBytes);
+  const totalMb = job.totalBytes ? formatFileSize(job.totalBytes) : "?";
 
   return {
-    step:
-      job.status === "completed"
-        ? "Hoàn tất"
-        : "Đang đồng bộ dữ liệu...",
+    step: "Đang đồng bộ dữ liệu...",
     description:
-      processedLines > 0
-        ? `Worker đã xử lý ${formatNumber(processedLines)} dòng, đồng bộ ${formatNumber(syncedLines)} hash lên Meta.`
-        : syncedLines > 0
-          ? `Đã đồng bộ ${formatNumber(syncedLines)} hash lên Meta.`
-          : "Worker đang đọc file từ NAS...",
-    value:
-      job.status === "completed"
-        ? 100
-        : processedLines > 0
-          ? Math.min(98, 18 + Math.round(Math.min(processedLines / 1000, 1) * 78))
-          : 18,
+      job.processedBytes > 0
+        ? `Đã upload ${processedMb} / ${totalMb} lên Facebook`
+        : "Worker đang đọc file từ NAS...",
+    value: 0,
   };
 }
 

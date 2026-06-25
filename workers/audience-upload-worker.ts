@@ -79,35 +79,40 @@ async function main() {
       );
 
       // Sync hashes while streaming from NAS
+      const totalBytes = fileMeta.contentLength ?? 0;
       const result = await syncLinesFromNas(
         audienceId,
         uploadJob.nasFilePath,
+        totalBytes,
         jobId,
         async (progress) => {
           await patchAudienceUploadJob(jobId, {
             processedLines: progress.processedLines,
+            processedBytes: progress.processedBytes,
             syncedHashCount: progress.syncedHashCount,
             syncedLines: progress.syncedLines,
-            invalidEntryCount: progress.invalidEntryCount,
+            totalBytes: totalBytes > 0 ? totalBytes : null,
             lastSessionId: progress.lastSessionId,
             updatedAt: new Date().toISOString(),
           });
 
           await bullJob.updateProgress({
             processedLines: progress.processedLines,
-            totalLines: progress.totalLines,
+            processedBytes: progress.processedBytes,
+            totalBytes: totalBytes > 0 ? totalBytes : undefined,
             syncedHashCount: progress.syncedHashCount,
           });
         }
       );
 
-      // Final update with totalLines from stream count
+      // Final update
       await patchAudienceUploadJob(jobId, {
         processedLines: result.processedLines,
+        processedBytes: result.processedBytes,
         syncedHashCount: result.syncedHashCount,
         syncedLines: result.syncedLines,
-        invalidEntryCount: result.invalidEntryCount,
         totalLines: result.processedLines,
+        totalBytes: totalBytes > 0 ? totalBytes : null,
         lastSessionId: result.lastSessionId,
         updatedAt: new Date().toISOString(),
       });
@@ -203,16 +208,16 @@ async function main() {
 
 interface SyncProgress {
   processedLines: number;
+  processedBytes: number;
   syncedHashCount: number;
   syncedLines: number;
-  invalidEntryCount: number;
-  totalLines: number | null;
   lastSessionId: string | null;
 }
 
 async function syncLinesFromNas(
   audienceId: string,
   nasFilePath: string,
+  totalBytes: number,
   jobId: string,
   onProgress: (progress: SyncProgress) => Promise<void>
 ) {
@@ -223,16 +228,17 @@ async function syncLinesFromNas(
   );
 
   let processedLines = 0;
+  let processedBytes = 0;
   let syncedHashCount = 0;
   let syncedLines = 0;
-  let invalidEntryCount = 0;
   let lastSessionId: string | null = null;
 
   // Accumulate hashes across stream yields until we reach batch size
   let accumulator: string[] = [];
 
-  for await (const hashes of streamNasFileLines(nasFilePath)) {
+  for await (const { hashes, bytesRead } of streamNasFileLines(nasFilePath)) {
     processedLines += hashes.length;
+    processedBytes += bytesRead;
     accumulator.push(...hashes);
 
     // Flush accumulator in batches
@@ -246,15 +252,13 @@ async function syncLinesFromNas(
       );
       syncedHashCount += result.num_received ?? batch.length;
       syncedLines += batch.length;
-      invalidEntryCount += result.num_invalid_entries ?? 0;
       lastSessionId = result.session_id ?? lastSessionId;
 
       await onProgress({
         processedLines,
+        processedBytes,
         syncedHashCount,
         syncedLines,
-        invalidEntryCount,
-        totalLines: null,
         lastSessionId,
       });
     }
@@ -269,24 +273,22 @@ async function syncLinesFromNas(
     );
     syncedHashCount += result.num_received ?? accumulator.length;
     syncedLines += accumulator.length;
-    invalidEntryCount += result.num_invalid_entries ?? 0;
     lastSessionId = result.session_id ?? lastSessionId;
 
     await onProgress({
       processedLines,
+      processedBytes,
       syncedHashCount,
       syncedLines,
-      invalidEntryCount,
-      totalLines: null,
       lastSessionId,
     });
   }
 
   return {
     processedLines,
+    processedBytes,
     syncedHashCount,
     syncedLines,
-    invalidEntryCount,
     lastSessionId,
   };
 }
