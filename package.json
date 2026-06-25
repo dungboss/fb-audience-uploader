@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "worker:audiences": "tsx workers/audience-upload-worker.ts"
+    "worker:audiences": "tsx --env-file=.env workers/audience-upload-worker.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1075.0",
