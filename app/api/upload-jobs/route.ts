@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { getClientSafeError } from "@/app/api/audiences/meta";
 import { createAudienceUploadJob } from "@/lib/audience-upload/jobs";
+import { enqueueAudienceUploadJob } from "@/lib/audience-upload/queue";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -13,7 +14,7 @@ export async function POST(request: Request) {
       kind?: unknown;
       name?: unknown;
       description?: unknown;
-      fileName?: unknown;
+      nasFilePath?: unknown;
       audienceId?: unknown;
     };
 
@@ -22,10 +23,13 @@ export async function POST(request: Request) {
       name: typeof body.name === "string" ? body.name : undefined,
       description:
         typeof body.description === "string" ? body.description : undefined,
-      fileName: typeof body.fileName === "string" ? body.fileName : "",
+      nasFilePath:
+        typeof body.nasFilePath === "string" ? body.nasFilePath : "",
       audienceId:
         typeof body.audienceId === "string" ? body.audienceId : undefined,
     });
+
+    await enqueueAudienceUploadJob(job.id);
 
     return NextResponse.json({ job }, { status: 201 });
   } catch (error) {

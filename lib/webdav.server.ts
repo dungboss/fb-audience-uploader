@@ -19,6 +19,12 @@ let cachedConfig: WebDavConfig | null = null;
 
 const isHttpUrl = (value: string) => /^https?:\/\//i.test(value);
 
+const parseContentLength = (value: string | null) => {
+  if (!value) return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
+
 const decodeXmlEntities = (value: string) =>
   value
     .replaceAll("&amp;", "&")
@@ -166,6 +172,52 @@ export async function writeTextToWebDav(
   if (!response.ok) {
     throw new Error(`WebDAV file write failed (${response.status})`);
   }
+}
+
+export async function fetchWebDavFileHead(
+  requestedPath: string
+): Promise<{ contentLength: number | null; contentType: string | null }> {
+  const normalizedPath = normalizeWebDavPath(requestedPath);
+
+  const response = await fetch(buildWebDavUrl(normalizedPath, false), {
+    method: "HEAD",
+    headers: {
+      ...getWebDavAuthHeaders(),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`WebDAV HEAD failed (${response.status})`);
+  }
+
+  return {
+    contentLength: parseContentLength(response.headers.get("content-length")),
+    contentType: response.headers.get("content-type") ?? null,
+  };
+}
+
+export async function fetchWebDavFileRange(
+  requestedPath: string,
+  start: number,
+  end: number
+): Promise<ArrayBuffer> {
+  const normalizedPath = normalizeWebDavPath(requestedPath);
+
+  const response = await fetch(buildWebDavUrl(normalizedPath, false), {
+    method: "GET",
+    headers: {
+      ...getWebDavAuthHeaders(),
+      Range: `bytes=${start}-${end}`,
+    },
+  });
+
+  if (!response.ok && response.status !== 206) {
+    throw new Error(
+      `WebDAV range request failed (${response.status})`
+    );
+  }
+
+  return response.arrayBuffer();
 }
 
 export async function deleteWebDavFile(requestedPath: string): Promise<void> {

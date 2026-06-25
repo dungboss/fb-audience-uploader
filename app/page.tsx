@@ -1,7 +1,6 @@
 "use client";
 
 import { startTransition, useDeferredValue, useEffect, useState } from "react";
-import Papa from "papaparse";
 import { toast } from "sonner";
 import {
   AlertCircle,
@@ -49,9 +48,6 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { NasFileBrowserDialog } from "@/components/nas-file-browser-dialog";
 
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const HASH_BATCH_SIZE = 400;
-const CLIENT_UPLOAD_CHUNK_SIZE = 10_000;
 const JOB_POLL_DELAY_MS = 250;
 const numberFormatter = new Intl.NumberFormat("vi-VN");
 
@@ -59,7 +55,6 @@ type AudienceAvailability = "ready" | "populating";
 type AudienceJobKind = "create" | "append";
 type AudienceJobStatus =
   | "draft"
-  | "uploading"
   | "queued"
   | "processing"
   | "completed"
@@ -76,21 +71,13 @@ type Audience = {
   timeUpdated: string | null;
 };
 
-type FileSelection = {
-  file: File;
+type NasFileSelection = {
   fileName: string;
-  fileSize: number;
-  source: "local" | "nas";
-  sourceLabel: string | null;
+  nasFilePath: string;
+  fileSize: number | null;
 };
 
 type NasBrowseTarget = "create" | "update";
-
-type UploadPipelineSummary = {
-  totalParts: number;
-  uniqueHashCount: number;
-  duplicateCount: number;
-};
 
 type ProgressState = {
   step: string;
@@ -104,14 +91,15 @@ type AudienceUploadJob = {
   status: AudienceJobStatus;
   name: string;
   description: string;
+  nasFilePath: string;
   fileName: string;
   audienceId: string | null;
-  receivedPartCount: number;
-  processedPartCount: number;
   receivedHashCount: number;
   syncedHashCount: number;
-  totalParts: number | null;
-  totalHashes: number | null;
+  syncedLines: number;
+  processedLines: number;
+  totalLines: number | null;
+  totalBytes: number | null;
   duplicateCount: number;
   invalidEntryCount: number;
   lastSessionId: string | null;
@@ -132,14 +120,6 @@ type AudienceJobResponse = {
   error?: string;
 };
 
-type UploadPartPresignResponse = {
-  job?: AudienceUploadJob;
-  uploadUrl?: string;
-  objectKey?: string;
-  expiresIn?: number;
-  error?: string;
-};
-
 type DeleteAudienceResponse = {
   audienceId: string;
   deleted: boolean;
@@ -149,7 +129,7 @@ type DeleteAudienceResponse = {
 export default function Home() {
   const [audienceName, setAudienceName] = useState(() => generateAudienceName());
   const [description, setDescription] = useState("");
-  const [createFile, setCreateFile] = useState<FileSelection | null>(null);
+  const [createFile, setCreateFile] = useState<NasFileSelection | null>(null);
   const [createProgress, setCreateProgress] = useState<ProgressState | null>(null);
   const [isCreateSubmitting, setIsCreateSubmitting] = useState(false);
 
@@ -164,7 +144,7 @@ export default function Home() {
 
   const [selectedAudience, setSelectedAudience] = useState<Audience | null>(null);
   const [isAddUsersDialogOpen, setIsAddUsersDialogOpen] = useState(false);
-  const [updateFile, setUpdateFile] = useState<FileSelection | null>(null);
+  const [updateFile, setUpdateFile] = useState<NasFileSelection | null>(null);
   const [updateProgress, setUpdateProgress] = useState<ProgressState | null>(null);
   const [isUpdateSubmitting, setIsUpdateSubmitting] = useState(false);
   const [nasBrowseTarget, setNasBrowseTarget] = useState<NasBrowseTarget | null>(
@@ -279,20 +259,6 @@ export default function Home() {
     }
   }
 
-  function buildFileSelection(
-    file: File,
-    source: FileSelection["source"],
-    sourceLabel: string | null = null
-  ): FileSelection {
-    return {
-      file,
-      fileName: file.name,
-      fileSize: file.size,
-      source,
-      sourceLabel,
-    };
-  }
-
   function openNasBrowser(target: NasBrowseTarget) {
     setNasBrowseTarget(target);
     setIsNasBrowserOpen(true);
@@ -303,12 +269,19 @@ export default function Home() {
     setNasBrowseTarget(null);
   }
 
-  async function handleNasFileSelected(file: File, filePath: string) {
+  async function handleNasFileSelected(
+    file: File,
+    nasFilePath: string
+  ) {
     if (!nasBrowseTarget) {
       throw new Error("Chưa xác định nơi nhận file từ NAS.");
     }
 
-    const selection = buildFileSelection(file, "nas", filePath);
+    const selection: NasFileSelection = {
+      fileName: file.name,
+      nasFilePath,
+      fileSize: file.size || null,
+    };
 
     if (nasBrowseTarget === "create") {
       setCreateFile(selection);
@@ -335,8 +308,8 @@ export default function Home() {
     setIsCreateSubmitting(true);
     setCreateProgress({
       step: "Đang khởi tạo job...",
-      description: "Server đang tạo upload job để nhận các shard hash.",
-      value: 4,
+      description: "Server đang tạo upload job và enqueue vào worker.",
+      value: 8,
     });
 
     try {
@@ -344,21 +317,13 @@ export default function Home() {
         kind: "create",
         name: audienceName.trim(),
         description: description.trim(),
-        fileName: createFile.fileName,
+        nasFilePath: createFile.nasFilePath,
       });
-
-      const summary = await uploadFileToJob({
-        file: createFile.file,
-        jobId: job.id,
-        setProgress: setCreateProgress,
-      });
-
-      await finalizeAudienceJob(job.id, summary);
 
       setCreateProgress({
-        step: "Đang xếp hàng xử lý...",
-        description: "Các shard đã ở NAS temp, worker nền sẽ đồng bộ lần lượt lên Meta.",
-        value: 64,
+        step: "Đang chờ worker xử lý...",
+        description: `Worker sẽ đọc file ${createFile.fileName} trực tiếp từ NAS, hash và gửi lên Meta.`,
+        value: 12,
       });
 
       const completedJob = await runAudienceJobUntilComplete(
@@ -366,11 +331,6 @@ export default function Home() {
         setCreateProgress
       );
 
-      setCreateProgress({
-        step: "Đang làm mới dashboard...",
-        description: "Đang tải lại danh sách audience mới nhất từ Meta.",
-        value: 96,
-      });
       await refreshAudiences({ silent: true });
       setCreateProgress({
         step: "Hoàn tất",
@@ -419,7 +379,7 @@ export default function Home() {
     }
 
     if (!updateFile) {
-      toast.error("Hãy chọn file CSV/TXT trước khi nạp thêm dữ liệu.");
+      toast.error("Hãy chọn file trên NAS trước khi nạp thêm dữ liệu.");
       return;
     }
 
@@ -427,28 +387,20 @@ export default function Home() {
     setUpdateProgress({
       step: "Đang khởi tạo job...",
       description: `Đang tạo job nạp thêm dữ liệu cho ${selectedAudience.name}.`,
-      value: 4,
+      value: 8,
     });
 
     try {
       const job = await createAudienceJob({
         kind: "append",
         audienceId: selectedAudience.id,
-        fileName: updateFile.fileName,
+        nasFilePath: updateFile.nasFilePath,
       });
-
-      const summary = await uploadFileToJob({
-        file: updateFile.file,
-        jobId: job.id,
-        setProgress: setUpdateProgress,
-      });
-
-      await finalizeAudienceJob(job.id, summary);
 
       setUpdateProgress({
-        step: "Đang xếp hàng xử lý...",
-        description: `Các shard đã ở NAS temp, worker sẽ nạp dần vào audience ${selectedAudience.id}.`,
-        value: 64,
+        step: "Đang chờ worker xử lý...",
+        description: `Worker sẽ đọc file từ NAS và nạp dần vào audience ${selectedAudience.id}.`,
+        value: 12,
       });
 
       const completedJob = await runAudienceJobUntilComplete(
@@ -456,11 +408,6 @@ export default function Home() {
         setUpdateProgress
       );
 
-      setUpdateProgress({
-        step: "Đang làm mới dashboard...",
-        description: "Audience đã nhận thêm dữ liệu, đang tải lại trạng thái mới nhất.",
-        value: 96,
-      });
       await refreshAudiences({ silent: true });
       setUpdateProgress({
         step: "Hoàn tất",
@@ -620,8 +567,7 @@ export default function Home() {
                 </div>
 
                 <div className="space-y-3">
-                  <UploadDropzone
-                    variant="dense"
+                  <NasUploadSelector
                     disabled={isCreateSubmitting}
                     title="Chọn file CSV/TXT từ NAS"
                     selection={createFile}
@@ -862,13 +808,12 @@ export default function Home() {
             <DialogDescription>
               {selectedAudience
                 ? `${selectedAudience.name} • ${selectedAudience.id}`
-                : "Chọn file CSV/TXT mới để nạp thêm EMAIL_SHA256 vào audience hiện tại."}
+                : "Chọn file CSV/TXT trên NAS để nạp thêm EMAIL_SHA256 vào audience hiện tại."}
             </DialogDescription>
           </DialogHeader>
 
           <div className="mt-5 space-y-5">
-            <UploadDropzone
-              variant="compact"
+            <NasUploadSelector
               disabled={isUpdateSubmitting}
               title="Chọn file CSV/TXT từ NAS"
               selection={updateFile}
@@ -994,7 +939,7 @@ export default function Home() {
   );
 }
 
-function UploadDropzone({
+function NasUploadSelector({
   disabled,
   title,
   onBrowseNas,
@@ -1003,8 +948,7 @@ function UploadDropzone({
   disabled?: boolean;
   title: string;
   onBrowseNas?: () => void;
-  selection: FileSelection | null;
-  variant?: "default" | "compact" | "dense";
+  selection: NasFileSelection | null;
 }) {
   return (
     <div className="space-y-3">
@@ -1012,18 +956,16 @@ function UploadDropzone({
         <div className="space-y-2">
           <div className="flex flex-wrap gap-2">
             <Badge variant="outline">{selection.fileName}</Badge>
-            <Badge variant="secondary">{formatFileSize(selection.fileSize)}</Badge>
-            <Badge
-              variant={selection.source === "nas" ? "warning" : "outline"}
-            >
-              {selection.source === "nas" ? "NAS" : "Local"}
-            </Badge>
+            {selection.fileSize !== null ? (
+              <Badge variant="secondary">
+                {formatFileSize(selection.fileSize)}
+              </Badge>
+            ) : null}
+            <Badge variant="warning">NAS</Badge>
           </div>
-          {selection.sourceLabel ? (
-            <p className="break-all text-xs text-muted-foreground">
-              {selection.sourceLabel}
-            </p>
-          ) : null}
+          <p className="break-all text-xs text-muted-foreground">
+            {selection.nasFilePath}
+          </p>
         </div>
       ) : (
         <p className="text-sm text-muted-foreground">{title}</p>
@@ -1078,211 +1020,9 @@ function AvailabilityBadge({
   return <Badge variant="warning">Populating</Badge>;
 }
 
-async function uploadFileToJob({
-  file,
-  jobId,
-  setProgress,
-}: {
-  file: File;
-  jobId: string;
-  setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>;
-}): Promise<UploadPipelineSummary> {
-  return new Promise((resolve, reject) => {
-    let parseCursor = 0;
-    const pendingEmails: string[] = [];
-    const pendingHashes: string[] = [];
-    let totalParts = 0;
-    let duplicateCount = 0;
-    const seenHashes = new Set<string>();
-    let settled = false;
-
-    const fail = (error: unknown) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      reject(error);
-    };
-
-    const finish = (summary: UploadPipelineSummary) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      resolve(summary);
-    };
-
-    const flushHashesToNas = async (force: boolean) => {
-      while (
-        pendingHashes.length >= CLIENT_UPLOAD_CHUNK_SIZE ||
-        (force && pendingHashes.length > 0)
-      ) {
-        const chunk = pendingHashes.splice(0, CLIENT_UPLOAD_CHUNK_SIZE);
-        const parseRatio = file.size > 0 ? Math.min(parseCursor / file.size, 1) : 1;
-        const partNumber = totalParts + 1;
-
-        setProgress({
-          step: "Đang tải shard lên NAS temp...",
-          description: `Đang gửi shard ${formatNumber(partNumber)} với ${formatNumber(chunk.length)} hash lên NAS temp.`,
-          value: Math.min(60, 42 + Math.round(parseRatio * 18)),
-        });
-
-        await uploadAudienceJobPart(jobId, totalParts, chunk);
-        totalParts += 1;
-        await waitFor(0);
-      }
-    };
-
-    const flushEmails = async () => {
-      if (pendingEmails.length === 0) {
-        return;
-      }
-
-      const emailBatch = pendingEmails.splice(0, pendingEmails.length);
-      const parseRatio = file.size > 0 ? Math.min(parseCursor / file.size, 1) : 1;
-
-      const hashedBatch = await hashEmailList(emailBatch, (completed, total) => {
-        const batchRatio = total === 0 ? 1 : completed / total;
-        setProgress({
-          step: "Đang mã hóa dữ liệu...",
-          description: `Đã băm ${formatNumber(completed)} / ${formatNumber(total)} email trong lô hiện tại.`,
-          value: Math.min(52, 20 + Math.round(parseRatio * 18 + batchRatio * 14)),
-        });
-      });
-
-      for (const hash of hashedBatch) {
-        if (seenHashes.has(hash)) {
-          duplicateCount += 1;
-          continue;
-        }
-
-        seenHashes.add(hash);
-        pendingHashes.push(hash);
-      }
-
-      await flushHashesToNas(false);
-    };
-
-    const flushAll = async () => {
-      await flushEmails();
-      await flushHashesToNas(true);
-
-      if (seenHashes.size === 0) {
-        throw new Error("Không tìm thấy email hợp lệ trong file vừa tải lên.");
-      }
-
-      setProgress({
-        step: "Đang chốt job...",
-        description: `${formatNumber(totalParts)} shard hash đã sẵn sàng để worker đồng bộ lên Meta.`,
-        value: 60,
-      });
-
-      finish({
-        totalParts,
-        uniqueHashCount: seenHashes.size,
-        duplicateCount,
-      });
-    };
-
-    Papa.parse<string[]>(file, {
-      skipEmptyLines: "greedy",
-      worker: false,
-      step: (results, parser) => {
-        if (settled) {
-          parser.abort();
-          return;
-        }
-
-        parseCursor = results.meta.cursor;
-        const row = Array.isArray(results.data) ? results.data : [];
-        const emails = extractNormalizedEmailsFromCells(row);
-
-        if (emails.length > 0) {
-          pendingEmails.push(...emails);
-        }
-
-        const parseRatio = file.size > 0 ? Math.min(parseCursor / file.size, 1) : 1;
-
-        if (pendingEmails.length >= HASH_BATCH_SIZE) {
-          parser.pause();
-          void flushEmails()
-            .then(() => {
-              if (!settled) {
-                parser.resume();
-              }
-            })
-            .catch((error) => {
-              parser.abort();
-              fail(error);
-            });
-          return;
-        }
-
-        setProgress({
-          step: "Đang đọc file...",
-          description: `PapaParse đang quét ${file.name} trực tiếp trên trình duyệt.`,
-          value: Math.min(18, 8 + Math.round(parseRatio * 10)),
-        });
-      },
-      complete: () => {
-        void flushAll().catch(fail);
-      },
-      error: fail,
-    });
-  });
-}
-
-function extractNormalizedEmailsFromCells(cells: string[]) {
-  const emails: string[] = [];
-
-  for (const cell of cells) {
-    const chunks = String(cell)
-      .replace(/\uFEFF/g, "")
-      .split(/[\s;|]+/)
-      .map((token) => token.trim().toLowerCase())
-      .filter(Boolean);
-
-    for (const candidate of chunks) {
-      if (EMAIL_PATTERN.test(candidate)) {
-        emails.push(candidate);
-      }
-    }
-  }
-
-  return emails;
-}
-
-async function hashEmailList(
-  emails: string[],
-  onProgress: (completed: number, total: number) => void
-) {
-  const chunkSize = 250;
-  const hashedEmails: string[] = [];
-
-  for (let index = 0; index < emails.length; index += chunkSize) {
-    const chunk = emails.slice(index, index + chunkSize);
-    const hashedChunk = await Promise.all(chunk.map(hashSha256));
-    hashedEmails.push(...hashedChunk);
-    onProgress(Math.min(index + chunk.length, emails.length), emails.length);
-    await waitFor(0);
-  }
-
-  return hashedEmails;
-}
-
-async function hashSha256(input: string) {
-  const encoded = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest("SHA-256", encoded);
-  return Array.from(new Uint8Array(digest))
-    .map((value) => value.toString(16).padStart(2, "0"))
-    .join("");
-}
-
 async function createAudienceJob(input: {
   kind: AudienceJobKind;
-  fileName: string;
+  nasFilePath: string;
   name?: string;
   description?: string;
   audienceId?: string;
@@ -1298,91 +1038,6 @@ async function createAudienceJob(input: {
 
   if (!response.ok || !payload.job) {
     throw new Error(payload.error || "Không thể tạo upload job.");
-  }
-
-  return payload.job;
-}
-
-async function uploadAudienceJobPart(
-  jobId: string,
-  partIndex: number,
-  hashedEmails: string[]
-) {
-  const presignResponse = await fetch(
-    `/api/upload-jobs/${jobId}/parts/presign`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        partIndex,
-      }),
-    }
-  );
-  const presignPayload = await readJsonSafe<UploadPartPresignResponse>(
-    presignResponse
-  );
-
-  if (
-    !presignResponse.ok ||
-    !presignPayload.uploadUrl ||
-    !presignPayload.objectKey
-  ) {
-    throw new Error(presignPayload.error || "Không thể presign shard upload.");
-  }
-
-  const uploadResponse = await fetch(presignPayload.uploadUrl, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(hashedEmails),
-  });
-
-  if (!uploadResponse.ok) {
-    throw new Error("NAS temp từ chối shard upload hiện tại.");
-  }
-
-  const response = await fetch(`/api/upload-jobs/${jobId}/parts/complete`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      partIndex,
-      hashCount: hashedEmails.length,
-      objectKey: presignPayload.objectKey,
-    }),
-  });
-  const payload = await readJsonSafe<AudienceJobResponse>(response);
-
-  if (!response.ok || !payload.job) {
-    throw new Error(payload.error || "Không thể ack shard upload.");
-  }
-
-  return payload.job;
-}
-
-async function finalizeAudienceJob(
-  jobId: string,
-  summary: UploadPipelineSummary
-) {
-  const response = await fetch(`/api/upload-jobs/${jobId}/finalize`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      totalParts: summary.totalParts,
-      totalHashes: summary.uniqueHashCount,
-      duplicateCount: summary.duplicateCount,
-    }),
-  });
-  const payload = await readJsonSafe<AudienceJobResponse>(response);
-
-  if (!response.ok || !payload.job) {
-    throw new Error(payload.error || "Không thể chốt upload job.");
   }
 
   return payload.job;
@@ -1422,32 +1077,38 @@ function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
     return {
       step: "Đang chờ worker xử lý...",
       description: "BullMQ đã nhận job và đang chờ lượt đồng bộ lên Meta.",
-      value: 66,
+      value: 14,
     };
   }
 
   if (job.kind === "create" && !job.audienceId) {
     return {
       step: "Đang khởi tạo đối tượng trên Meta...",
-      description: "Worker đang tạo audience trống trước khi nạp các shard hash.",
-      value: 66,
+      description: "Worker đang tạo audience trống trước khi nạp dữ liệu.",
+      value: 18,
     };
   }
 
-  const totalHashes = job.totalHashes ?? job.receivedHashCount;
-  const syncedHashes = Math.min(job.syncedHashCount, totalHashes);
-  const ratio = totalHashes > 0 ? syncedHashes / totalHashes : 0;
+  const processedLines = job.processedLines;
+  const syncedLines = job.syncedLines || 0;
 
   return {
-    step: job.status === "completed" ? "Hoàn tất" : "Đang đồng bộ dữ liệu...",
+    step:
+      job.status === "completed"
+        ? "Hoàn tất"
+        : "Đang đồng bộ dữ liệu...",
     description:
-      totalHashes > 0
-        ? `Đã đồng bộ ${formatNumber(syncedHashes)} / ${formatNumber(totalHashes)} hash lên Meta.`
-        : `Đã xử lý ${formatNumber(job.processedPartCount)} shard.`,
+      processedLines > 0
+        ? `Worker đã xử lý ${formatNumber(processedLines)} dòng, đồng bộ ${formatNumber(syncedLines)} hash lên Meta.`
+        : syncedLines > 0
+          ? `Đã đồng bộ ${formatNumber(syncedLines)} hash lên Meta.`
+          : "Worker đang đọc file từ NAS...",
     value:
       job.status === "completed"
         ? 100
-        : Math.min(98, 68 + Math.round(ratio * 28)),
+        : processedLines > 0
+          ? Math.min(98, 18 + Math.round(Math.min(processedLines / 1000, 1) * 78))
+          : 18,
   };
 }
 

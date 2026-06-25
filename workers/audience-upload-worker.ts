@@ -8,17 +8,18 @@ import {
 import { getAudienceUploadConfig } from "../lib/audience-upload/env";
 import {
   getAudienceUploadJob,
-  listAudienceUploadParts,
   markAudienceUploadJobCompleted,
   markAudienceUploadJobFailed,
-  markAudienceUploadPartProcessed,
   patchAudienceUploadJob,
 } from "../lib/audience-upload/jobs";
 import {
   getBullConnectionOptions,
   getRedis,
 } from "../lib/audience-upload/redis";
-import { deleteShardObject, readShardHashes } from "../lib/audience-upload/storage";
+import {
+  getNasFileMeta,
+  streamNasFileLines,
+} from "../lib/audience-upload/storage";
 import type { AudienceUploadJobPayload } from "../lib/audience-upload/types";
 
 const FACEBOOK_MAX_HASHES_PER_SECOND = 10_000;
@@ -50,6 +51,7 @@ async function main() {
 
       let audienceId = uploadJob.audienceId;
 
+      // Create audience if needed
       if (uploadJob.kind === "create" && !audienceId) {
         const createdAudience = await retryMetaAware(() =>
           createEmptyAudience({
@@ -70,28 +72,45 @@ async function main() {
         throw new Error("Worker chưa có audienceId để sync dữ liệu lên Meta.");
       }
 
-      const parts = await listAudienceUploadParts(jobId);
+      // Get file metadata
+      const fileMeta = await getNasFileMeta(uploadJob.nasFilePath);
+      console.info(
+        `[audience-upload-worker] nas file ${uploadJob.nasFilePath}, content-length=${fileMeta.contentLength} (jobId=${jobId})`
+      );
 
-      for (const part of parts) {
-        const hashes = await readShardHashes(part.objectKey);
-        const syncResult = await syncHashesToMeta(audienceId, hashes);
+      // Sync hashes while streaming from NAS
+      const result = await syncLinesFromNas(
+        audienceId,
+        uploadJob.nasFilePath,
+        jobId,
+        async (progress) => {
+          await patchAudienceUploadJob(jobId, {
+            processedLines: progress.processedLines,
+            syncedHashCount: progress.syncedHashCount,
+            syncedLines: progress.syncedLines,
+            invalidEntryCount: progress.invalidEntryCount,
+            lastSessionId: progress.lastSessionId,
+            updatedAt: new Date().toISOString(),
+          });
 
-        await deleteShardObject(part.objectKey);
-        uploadJob = await markAudienceUploadPartProcessed({
-          jobId,
-          partIndex: part.partIndex,
-          syncedHashCount: syncResult.uploadedCount,
-          invalidEntryCount: syncResult.invalidEntryCount,
-          audienceId,
-          lastSessionId: syncResult.lastSessionId,
-        });
+          await bullJob.updateProgress({
+            processedLines: progress.processedLines,
+            totalLines: progress.totalLines,
+            syncedHashCount: progress.syncedHashCount,
+          });
+        }
+      );
 
-        await bullJob.updateProgress({
-          processedParts: uploadJob.processedPartCount,
-          totalParts: uploadJob.totalParts ?? uploadJob.receivedPartCount,
-          syncedHashCount: uploadJob.syncedHashCount,
-        });
-      }
+      // Final update with totalLines from stream count
+      await patchAudienceUploadJob(jobId, {
+        processedLines: result.processedLines,
+        syncedHashCount: result.syncedHashCount,
+        syncedLines: result.syncedLines,
+        invalidEntryCount: result.invalidEntryCount,
+        totalLines: result.processedLines,
+        lastSessionId: result.lastSessionId,
+        updatedAt: new Date().toISOString(),
+      });
 
       uploadJob = await markAudienceUploadJobCompleted(jobId);
 
@@ -135,22 +154,33 @@ async function main() {
 
   worker.on("failed", async (bullJob, error) => {
     const jobId = bullJob?.data?.jobId;
+    const bullJobId = bullJob?.id ?? "unknown";
+    const attemptsMade = bullJob?.attemptsMade ?? 0;
+    const maxAttempts = bullJob?.opts?.attempts ?? 1;
+
+    console.error(
+      `[audience-upload-worker] failed ${bullJobId} (jobId=${jobId}, attempts=${attemptsMade}/${maxAttempts}): ${error.message}`,
+      error.stack ? `\n${error.stack}` : ""
+    );
 
     if (jobId) {
       if (bullJob && shouldRetryLater(bullJob, error)) {
+        const retryMessage = buildRetryMessage(error);
+        console.info(
+          `[audience-upload-worker] retrying ${bullJobId} later (attempt ${attemptsMade}/${maxAttempts}): ${retryMessage}`
+        );
         await patchAudienceUploadJob(jobId, {
           status: "queued",
-          errorMessage: buildRetryMessage(error),
+          errorMessage: retryMessage,
           updatedAt: new Date().toISOString(),
         });
       } else {
+        console.error(
+          `[audience-upload-worker] permanently failing ${bullJobId} (attempt ${attemptsMade}/${maxAttempts} exhausted): ${error.message}`
+        );
         await markAudienceUploadJobFailed(jobId, error.message);
       }
     }
-
-    console.error(
-      `[audience-upload-worker] failed ${bullJob?.id ?? "unknown"}: ${error.message}`
-    );
   });
 
   const shutdown = async (signal: string) => {
@@ -171,28 +201,91 @@ async function main() {
   );
 }
 
-async function syncHashesToMeta(audienceId: string, hashes: string[]) {
+interface SyncProgress {
+  processedLines: number;
+  syncedHashCount: number;
+  syncedLines: number;
+  invalidEntryCount: number;
+  totalLines: number | null;
+  lastSessionId: string | null;
+}
+
+async function syncLinesFromNas(
+  audienceId: string,
+  nasFilePath: string,
+  jobId: string,
+  onProgress: (progress: SyncProgress) => Promise<void>
+) {
   const { metaBatchSize, metaRequestIntervalMs } = getAudienceUploadConfig();
   const effectiveBatchSize = Math.min(
     metaBatchSize,
     FACEBOOK_MAX_HASHES_PER_SECOND
   );
-  let uploadedCount = 0;
+
+  let processedLines = 0;
+  let syncedHashCount = 0;
+  let syncedLines = 0;
   let invalidEntryCount = 0;
   let lastSessionId: string | null = null;
 
-  for (let index = 0; index < hashes.length; index += effectiveBatchSize) {
-    const batch = hashes.slice(index, index + effectiveBatchSize);
+  // Accumulate hashes across stream yields until we reach batch size
+  let accumulator: string[] = [];
+
+  for await (const hashes of streamNasFileLines(nasFilePath)) {
+    processedLines += hashes.length;
+    accumulator.push(...hashes);
+
+    // Flush accumulator in batches
+    while (accumulator.length >= effectiveBatchSize) {
+      const batch = accumulator.splice(0, effectiveBatchSize);
+
+      await acquireMetaRequestSlot(metaRequestIntervalMs);
+
+      const result = await retryMetaAware(() =>
+        uploadHashedUsers(audienceId, batch)
+      );
+      syncedHashCount += result.num_received ?? batch.length;
+      syncedLines += batch.length;
+      invalidEntryCount += result.num_invalid_entries ?? 0;
+      lastSessionId = result.session_id ?? lastSessionId;
+
+      await onProgress({
+        processedLines,
+        syncedHashCount,
+        syncedLines,
+        invalidEntryCount,
+        totalLines: null,
+        lastSessionId,
+      });
+    }
+  }
+
+  // Flush remaining accumulator
+  if (accumulator.length > 0) {
     await acquireMetaRequestSlot(metaRequestIntervalMs);
 
-    const result = await retryMetaAware(() => uploadHashedUsers(audienceId, batch));
-    uploadedCount += result.num_received ?? batch.length;
+    const result = await retryMetaAware(() =>
+      uploadHashedUsers(audienceId, accumulator)
+    );
+    syncedHashCount += result.num_received ?? accumulator.length;
+    syncedLines += accumulator.length;
     invalidEntryCount += result.num_invalid_entries ?? 0;
     lastSessionId = result.session_id ?? lastSessionId;
+
+    await onProgress({
+      processedLines,
+      syncedHashCount,
+      syncedLines,
+      invalidEntryCount,
+      totalLines: null,
+      lastSessionId,
+    });
   }
 
   return {
-    uploadedCount,
+    processedLines,
+    syncedHashCount,
+    syncedLines,
     invalidEntryCount,
     lastSessionId,
   };

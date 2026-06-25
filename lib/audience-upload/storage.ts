@@ -1,122 +1,90 @@
+import { createHash } from "node:crypto";
+
 import { FacebookApiError } from "@/app/api/audiences/meta";
-import {
-  deleteWebDavFile,
-  writeTextToWebDav,
-} from "@/lib/webdav.server";
+import { fetchWebDavFileHead, fetchWebDavFileRange } from "@/lib/webdav.server";
 
-import { getAudienceUploadConfig } from "./env";
+const NAS_CHUNK_BYTES = 1024 * 1024; // 1 MB per range request
 
-const HASH_PATTERN = /^[a-f0-9]{64}$/;
-
-export function buildShardObjectKey(jobId: string, partIndex: number) {
-  const { shardTempDir } = getAudienceUploadConfig();
-
-  return `${shardTempDir}/${jobId}/parts/${String(partIndex).padStart(6, "0")}.json`;
+export interface NasFileMeta {
+  contentLength: number | null;
+  contentType: string | null;
 }
 
-export async function createShardUploadUrl(
-  jobId: string,
-  partIndex: number
-): Promise<{ objectKey: string; uploadUrl: string; expiresIn: number }> {
-  if (!Number.isInteger(partIndex) || partIndex < 0) {
-    throw new FacebookApiError("Part index không hợp lệ.", 400);
-  }
-
-  const config = getAudienceUploadConfig();
-  const objectKey = buildShardObjectKey(jobId, partIndex);
-
+export async function getNasFileMeta(
+  nasFilePath: string
+): Promise<NasFileMeta> {
+  const head = await fetchWebDavFileHead(nasFilePath);
   return {
-    objectKey,
-    uploadUrl: `/api/upload-jobs/${jobId}/parts/upload?partIndex=${partIndex}`,
-    expiresIn: config.presignedUrlTtlSeconds,
+    contentLength: head.contentLength,
+    contentType: head.contentType,
   };
 }
 
-export async function writeShardHashes(
-  objectKey: string,
-  content: string
-): Promise<void> {
-  await writeTextToWebDav(objectKey, content);
-}
+export async function* streamNasFileLines(
+  nasFilePath: string
+): AsyncGenerator<string[], void, void> {
+  const head = await fetchWebDavFileHead(nasFilePath);
 
-export async function readShardHashes(objectKey: string): Promise<string[]> {
-  const config = getAudienceUploadConfig();
+  if (head.contentLength === null) {
+    throw new FacebookApiError(
+      "NAS file không trả về Content-Length, không thể streaming.",
+      502
+    );
+  }
 
-  const response = await fetch(
-    buildShardReadUrl(objectKey),
-    {
-      method: "GET",
-      headers: {
-        ...getShardReadHeaders(config),
-        Accept: "application/json",
-      },
+  const totalBytes = head.contentLength;
+  let offset = 0;
+  let leftover = "";
+
+  while (offset < totalBytes) {
+    const end = Math.min(offset + NAS_CHUNK_BYTES - 1, totalBytes - 1);
+    const buffer = await fetchWebDavFileRange(nasFilePath, offset, end);
+
+    let chunk = new TextDecoder("utf-8", { fatal: false }).decode(buffer);
+
+    // Remove BOM from the first chunk
+    if (offset === 0 && chunk.startsWith("\uFEFF")) {
+      chunk = chunk.slice(1);
     }
-  );
 
-  if (!response.ok) {
-    throw new FacebookApiError(
-      `Không thể đọc shard từ NAS temp (${response.status}).`,
-      502
-    );
+    // Prepend leftover from previous chunk boundary
+    const text = leftover + chunk;
+    const lines = text.split("\n");
+
+    // The last line may be incomplete (crosses chunk boundary)
+    leftover = lines.pop() ?? "";
+
+    offset = end + 1;
+
+    if (lines.length > 0) {
+      const hashes: string[] = [];
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.length === 0) continue;
+
+        const normalized = normalizeLineValue(trimmed);
+        const hash = createHash("sha256").update(normalized).digest("hex");
+        hashes.push(hash);
+      }
+
+      if (hashes.length > 0) {
+        yield hashes;
+      }
+    }
   }
 
-  const payload = await response.text();
-
-  try {
-    const parsedPayload = JSON.parse(payload) as unknown;
-    return normalizeHashList(parsedPayload);
-  } catch {
-    throw new FacebookApiError(
-      "NAS temp shard chứa dữ liệu JSON không hợp lệ.",
-      502
-    );
+  // Process final leftover line
+  if (leftover.trim().length > 0) {
+    const normalized = normalizeLineValue(leftover.trim());
+    const hash = createHash("sha256").update(normalized).digest("hex");
+    yield [hash];
   }
 }
 
-export async function deleteShardObject(objectKey: string): Promise<void> {
-  await deleteWebDavFile(objectKey);
-}
-
-function normalizeHashList(input: unknown): string[] {
-  if (!Array.isArray(input) || input.length === 0) {
-    throw new FacebookApiError("Shard hash không hợp lệ hoặc đang trống.", 400);
-  }
-
-  const hashes = input.map((value) => String(value).trim().toLowerCase());
-  const invalidHash = hashes.find((hash) => !HASH_PATTERN.test(hash));
-
-  if (invalidHash) {
-    throw new FacebookApiError(
-      "NAS temp shard chứa dữ liệu không phải SHA-256 hợp lệ.",
-      400
-    );
-  }
-
-  return hashes;
-}
-
-function buildShardReadUrl(objectKey: string): string {
-  const baseUrl = process.env.WEBDAV_BASE_URL?.trim() || "https://nas-api.batmedia.info/";
-  const normalizedBase = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-  const encoded = objectKey
-    .split("/")
-    .filter(Boolean)
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-
-  return `${normalizedBase}${encoded}`;
-}
-
-function getShardReadHeaders(
-  config: ReturnType<typeof getAudienceUploadConfig>
-): Record<string, string> {
-  const headers: Record<string, string> = {};
-
-  if (config.webdavUsername && config.webdavPassword) {
-    headers.Authorization = `Basic ${Buffer.from(
-      `${config.webdavUsername}:${config.webdavPassword}`
-    ).toString("base64")}`;
-  }
-
-  return headers;
+function normalizeLineValue(value: string): string {
+  return value
+    .toLowerCase()
+    .replaceAll(/\s+/g, "")
+    .replaceAll(/[^\x20-\x7E\xC0-\xFF\xA0-\xFF]/g, "");
 }

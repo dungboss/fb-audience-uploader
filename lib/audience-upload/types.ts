@@ -1,7 +1,6 @@
 export type AudienceUploadJobKind = "create" | "append";
 export type AudienceUploadJobStatus =
   | "draft"
-  | "uploading"
   | "queued"
   | "processing"
   | "completed"
@@ -13,14 +12,15 @@ export interface AudienceUploadJob {
   status: AudienceUploadJobStatus;
   name: string;
   description: string;
+  nasFilePath: string;
   fileName: string;
   audienceId: string | null;
-  receivedPartCount: number;
-  processedPartCount: number;
   receivedHashCount: number;
   syncedHashCount: number;
-  totalParts: number | null;
-  totalHashes: number | null;
+  syncedLines: number;
+  processedLines: number;
+  totalLines: number | null;
+  totalBytes: number | null;
   duplicateCount: number;
   invalidEntryCount: number;
   lastSessionId: string | null;
@@ -29,12 +29,6 @@ export interface AudienceUploadJob {
   completedAt: string | null;
   createdAt: string;
   updatedAt: string;
-}
-
-export interface AudienceUploadPart {
-  partIndex: number;
-  objectKey: string;
-  hashCount: number;
 }
 
 export interface AudienceUploadJobPayload {
