@@ -4,7 +4,8 @@ export type AudienceUploadJobStatus =
   | "queued"
   | "processing"
   | "completed"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export interface AudienceUploadJob {
   id: string;
@@ -14,6 +15,7 @@ export interface AudienceUploadJob {
   description: string;
   nasFilePath: string;
   fileName: string;
+  fileSize: number | null;
   audienceId: string | null;
   syncedHashCount: number;
   syncedLines: number;

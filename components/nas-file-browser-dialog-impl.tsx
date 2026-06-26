@@ -9,7 +9,6 @@ import {
   RefreshCcw,
   Search,
 } from "lucide-react";
-import { toast } from "sonner";
 
 import { NasFolderTree } from "@/components/nas-folder-tree";
 import { Badge } from "@/components/ui/badge";
@@ -43,24 +42,20 @@ import {
 } from "@/lib/webdav";
 import { useWebDavFolderTree } from "@/hooks/use-webdav-folder-tree";
 
-const WEBDAV_FILE_API_URL = "/api/webdav/file";
+type NasFileSelection = {
+  fileName: string;
+  nasFilePath: string;
+  fileSize: number | null;
+};
 
 type NasFileBrowserDialogProps = {
   initialPath?: string;
   isOpen: boolean;
   onClose: () => void;
   onCurrentPathChange?: (path: string) => void;
-  onSelectFile: (file: File, filePath: string) => Promise<void> | void;
+  onSelectFile: (selection: NasFileSelection) => void;
   rootLabel?: string;
 };
-
-function getErrorMessage(error: unknown, fallbackMessage: string) {
-  if (error instanceof Error && error.message.trim()) {
-    return error.message;
-  }
-
-  return fallbackMessage;
-}
 
 export function NasFileBrowserDialog({
   initialPath,
@@ -90,14 +85,12 @@ export function NasFileBrowserDialog({
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [selectionErrorMessage, setSelectionErrorMessage] = useState<string | null>(null);
-  const [isSelectingFile, setIsSelectingFile] = useState(false);
 
   useEffect(() => {
     queueMicrotask(() => {
       setSearchQuery("");
       setSelectedFilePath(null);
       setSelectionErrorMessage(null);
-      setIsSelectingFile(false);
     });
   }, [isOpen]);
 
@@ -136,7 +129,7 @@ export function NasFileBrowserDialog({
   );
 
   const combinedErrorMessage = treeErrorMessage || selectionErrorMessage;
-  const isBusy = isInitializing || isSelectingFile;
+  const isBusy = isInitializing;
 
   function handleNavigatePath(pathValue: string) {
     setSelectedFilePath(null);
@@ -153,75 +146,30 @@ export function NasFileBrowserDialog({
     setSelectionErrorMessage(null);
   }
 
-  async function handleConfirmSelection() {
-    if (!selectedFileEntry || isSelectingFile) {
+  function handleConfirmSelection() {
+    if (!selectedFileEntry) {
       return;
     }
 
-    setIsSelectingFile(true);
-    setSelectionErrorMessage(null);
-    let shouldClose = false;
+    onSelectFile({
+      fileName: selectedFileEntry.name,
+      nasFilePath: selectedFileEntry.path,
+      fileSize: selectedFileEntry.size ?? null,
+    });
 
-    try {
-      const response = await fetch(
-        `${WEBDAV_FILE_API_URL}?path=${encodeURIComponent(
-          normalizeWebDavPath(selectedFileEntry.path)
-        )}`,
-        {
-          cache: "no-store",
-        }
-      );
-
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => ({}))) as {
-          error?: string;
-        };
-
-        throw new Error(payload.error || "Không thể tải file từ NAS.");
-      }
-
-      const blob = await response.blob();
-      const mimeType =
-        response.headers.get("content-type")?.split(";")[0]?.trim() ||
-        selectedFileEntry.mimeType ||
-        blob.type ||
-        "application/octet-stream";
-
-      const file = new File([blob], selectedFileEntry.name, {
-        type: mimeType,
-      });
-
-      await onSelectFile(file, selectedFileEntry.path);
-      shouldClose = true;
-    } catch (error) {
-      const message = getErrorMessage(error, "Không thể tải file từ NAS.");
-      setSelectionErrorMessage(message);
-      toast.error("Chọn file từ NAS thất bại.", {
-        description: message,
-      });
-    } finally {
-      setIsSelectingFile(false);
-    }
-
-    if (shouldClose) {
-      onClose();
-    }
+    onClose();
   }
 
   return (
     <Dialog
       open={isOpen}
       onOpenChange={(open) => {
-        if (!open && !isSelectingFile) {
+        if (!open) {
           onClose();
         }
       }}
-      disablePointerDismissal={isSelectingFile}
     >
-      <DialogContent
-        className="max-w-7xl overflow-hidden p-0"
-        showCloseButton={!isSelectingFile}
-      >
+      <DialogContent className="max-w-7xl overflow-hidden p-0" showCloseButton>
         <div className="flex max-h-[90vh] flex-col">
           <div className="border-b border-border/70 px-6 pt-6 pb-4 pr-12">
             <DialogHeader className="pr-0">
@@ -430,30 +378,16 @@ export function NasFileBrowserDialog({
 
           <DialogFooter className="border-t border-border/70 px-6 py-4">
             <div className="flex w-full flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={onClose}
-                disabled={isSelectingFile}
-              >
+              <Button type="button" variant="outline" onClick={onClose}>
                 Hủy
               </Button>
               <Button
                 type="button"
-                onClick={() => void handleConfirmSelection()}
-                disabled={!selectedFileEntry || isCurrentDirectoryLoading || isSelectingFile}
+                onClick={() => handleConfirmSelection()}
+                disabled={!selectedFileEntry || isCurrentDirectoryLoading}
               >
-                {isSelectingFile ? (
-                  <>
-                    <Loader2 className="size-4 animate-spin" />
-                    Đang tải...
-                  </>
-                ) : (
-                  <>
-                    <FileText className="size-4" />
-                    Chọn file
-                  </>
-                )}
+                <FileText className="size-4" />
+                Chọn file
               </Button>
             </div>
           </DialogFooter>

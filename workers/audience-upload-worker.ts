@@ -79,7 +79,8 @@ async function main() {
       );
 
       // Sync hashes while streaming from NAS
-      const totalBytes = fileMeta.contentLength ?? 0;
+      // Prefer fileSize from PROPFIND (NAS browser) over Content-Length from HEAD
+      const totalBytes = uploadJob.fileSize ?? fileMeta.contentLength ?? 0;
       const result = await syncLinesFromNas(
         audienceId,
         uploadJob.nasFilePath,
@@ -236,7 +237,10 @@ async function syncLinesFromNas(
   // Accumulate hashes across stream yields until we reach batch size
   let accumulator: string[] = [];
 
-  for await (const { hashes, bytesRead } of streamNasFileLines(nasFilePath)) {
+  for await (const { hashes, bytesRead } of streamNasFileLines(
+    nasFilePath,
+    { knownSize: totalBytes > 0 ? totalBytes : null }
+  )) {
     processedLines += hashes.length;
     processedBytes += bytesRead;
     accumulator.push(...hashes);

@@ -260,6 +260,25 @@ async function ensureWebDavParentDirectory(
   }
 }
 
+export async function fetchWebDavFileStream(
+  requestedPath: string
+): Promise<ReadableStream<Uint8Array>> {
+  const normalizedPath = normalizeWebDavPath(requestedPath);
+
+  const response = await fetch(buildWebDavUrl(normalizedPath, false), {
+    method: "GET",
+    headers: {
+      ...getWebDavAuthHeaders(),
+    },
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`WebDAV file stream failed (${response.status})`);
+  }
+
+  return response.body;
+}
+
 export async function fetchWebDavDirectoryResponse(
   requestedPath: string
 ): Promise<WebDavDirectoryResponse> {

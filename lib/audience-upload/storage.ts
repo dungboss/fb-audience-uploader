@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
 
-import { FacebookApiError } from "@/app/api/audiences/meta";
-import { fetchWebDavFileHead, fetchWebDavFileRange } from "@/lib/webdav.server";
+import {
+  fetchWebDavFileHead,
+  fetchWebDavFileRange,
+  fetchWebDavFileStream,
+} from "@/lib/webdav.server";
 
-const NAS_CHUNK_BYTES = 1024 * 1024; // 1 MB per range request
+const NAS_CHUNK_BYTES = 10 * 1024 * 1024; // 10 MB per range request
 
 export interface NasFileMeta {
   contentLength: number | null;
@@ -25,19 +28,37 @@ export interface StreamChunk {
   bytesRead: number;
 }
 
+export interface StreamNasFileLinesOptions {
+  /**
+   * Known file size from PROPFIND listing (used for progress % when
+   * the server doesn't return Content-Length on HEAD requests).
+   */
+  knownSize?: number | null;
+}
+
 export async function* streamNasFileLines(
-  nasFilePath: string
+  nasFilePath: string,
+  options: StreamNasFileLinesOptions = {}
 ): AsyncGenerator<StreamChunk, void, void> {
   const head = await fetchWebDavFileHead(nasFilePath);
 
-  if (head.contentLength === null) {
-    throw new FacebookApiError(
-      "NAS file không trả về Content-Length, không thể streaming.",
-      502
-    );
+  // Prefer PROPFIND size over HEAD Content-Length for progress display
+  const knownSize = options.knownSize ?? head.contentLength;
+
+  // When server returns Content-Length, use range requests (efficient, resumable)
+  if (head.contentLength !== null) {
+    yield* streamViaRangeRequests(nasFilePath, head.contentLength);
+    return;
   }
 
-  const totalBytes = head.contentLength;
+  // Fallback: server didn't return Content-Length — stream the whole file
+  yield* streamViaFullRead(nasFilePath, knownSize);
+}
+
+async function* streamViaRangeRequests(
+  nasFilePath: string,
+  totalBytes: number
+): AsyncGenerator<StreamChunk, void, void> {
   let offset = 0;
   let leftover = "";
 
@@ -63,19 +84,9 @@ export async function* streamNasFileLines(
     offset = end + 1;
 
     if (lines.length > 0) {
-      const hashes: string[] = [];
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.length === 0) continue;
-
-        const normalized = normalizeLineValue(trimmed);
-        const hash = createHash("sha256").update(normalized).digest("hex");
-        hashes.push(hash);
-      }
-
-      if (hashes.length > 0) {
-        yield { hashes, bytesRead: chunkBytes };
+      const hashed = hashLines(lines);
+      if (hashed.length > 0) {
+        yield { hashes: hashed, bytesRead: chunkBytes };
       }
     }
   }
@@ -86,6 +97,63 @@ export async function* streamNasFileLines(
     const hash = createHash("sha256").update(normalized).digest("hex");
     yield { hashes: [hash], bytesRead: 0 };
   }
+}
+
+async function* streamViaFullRead(
+  nasFilePath: string,
+  knownSize: number | null
+): AsyncGenerator<StreamChunk, void, void> {
+  const stream = await fetchWebDavFileStream(nasFilePath);
+  const reader = stream.getReader();
+  let leftover = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunkBytes = value.byteLength;
+      let chunk = new TextDecoder("utf-8", { fatal: false }).decode(value);
+
+      // Prepend leftover from previous chunk boundary
+      const text = leftover + chunk;
+      const lines = text.split("\n");
+
+      // The last line may be incomplete
+      leftover = lines.pop() ?? "";
+
+      if (lines.length > 0) {
+        const hashed = hashLines(lines);
+        if (hashed.length > 0) {
+          yield { hashes: hashed, bytesRead: chunkBytes };
+        }
+      }
+    }
+
+    // Process final leftover line
+    if (leftover.trim().length > 0) {
+      const normalized = normalizeLineValue(leftover.trim());
+      const hash = createHash("sha256").update(normalized).digest("hex");
+      yield { hashes: [hash], bytesRead: 0 };
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function hashLines(lines: string[]): string[] {
+  const result: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+
+    const normalized = normalizeLineValue(trimmed);
+    const hash = createHash("sha256").update(normalized).digest("hex");
+    result.push(hash);
+  }
+
+  return result;
 }
 
 function normalizeLineValue(value: string): string {

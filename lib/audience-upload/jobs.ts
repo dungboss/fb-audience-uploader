@@ -21,6 +21,7 @@ export async function createAudienceUploadJob(input: {
   name?: string;
   description?: string;
   audienceId?: string;
+  fileSize?: number | null;
 }) {
   const kind = input.kind;
   const nasFilePath = input.nasFilePath.trim();
@@ -52,6 +53,7 @@ export async function createAudienceUploadJob(input: {
     description,
     nasFilePath,
     fileName,
+    fileSize: typeof input.fileSize === "number" && input.fileSize > 0 ? input.fileSize : null,
     audienceId: kind === "append" ? audienceId : null,
     syncedHashCount: 0,
     syncedLines: 0,
@@ -143,6 +145,29 @@ export async function markAudienceUploadJobFailed(
   return getAudienceUploadJob(jobId);
 }
 
+export async function cancelAudienceUploadJob(jobId: string) {
+  const normalizedJobId = jobId.trim();
+
+  if (!normalizedJobId) {
+    throw new FacebookApiError("Job ID không hợp lệ.", 400);
+  }
+
+  const existing = await getAudienceUploadJob(normalizedJobId);
+
+  if (existing.status !== "queued" && existing.status !== "processing") {
+    // Job already reached a terminal state — return as-is silently
+    return existing;
+  }
+
+  await getRedis().hset(getJobKey(normalizedJobId), {
+    status: "cancelled",
+    updatedAt: new Date().toISOString(),
+  });
+  await refreshJobExpiry(normalizedJobId);
+
+  return getAudienceUploadJob(normalizedJobId);
+}
+
 async function persistJob(job: AudienceUploadJob) {
   await getRedis().hset(getJobKey(job.id), toRedisHashPatch(job));
 }
@@ -158,13 +183,14 @@ function parseJobPayload(jobId: string, payload: Record<string, string>) {
     kind: parseEnum(payload.kind, ["create", "append"], "create"),
     status: parseEnum(
       payload.status,
-      ["draft", "queued", "processing", "completed", "failed"],
+      ["draft", "queued", "processing", "completed", "failed", "cancelled"],
       "draft"
     ) as AudienceUploadJobStatus,
     name: payload.name ?? "",
     description: payload.description ?? "",
     nasFilePath: payload.nasFilePath ?? "",
     fileName: payload.fileName ?? "",
+    fileSize: parseNullableInteger(payload.fileSize),
     audienceId: payload.audienceId || null,
     syncedHashCount: parseInteger(payload.syncedHashCount),
     syncedLines: parseInteger(payload.syncedLines),

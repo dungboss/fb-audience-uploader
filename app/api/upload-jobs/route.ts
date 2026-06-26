@@ -39,6 +39,7 @@ export async function POST(request: Request) {
       description?: unknown;
       nasFilePath?: unknown;
       audienceId?: unknown;
+      fileSize?: unknown;
     };
 
     const job = await createAudienceUploadJob({
@@ -50,6 +51,8 @@ export async function POST(request: Request) {
         typeof body.nasFilePath === "string" ? body.nasFilePath : "",
       audienceId:
         typeof body.audienceId === "string" ? body.audienceId : undefined,
+      fileSize:
+        typeof body.fileSize === "number" ? body.fileSize : undefined,
     });
 
     await enqueueAudienceUploadJob(job.id);

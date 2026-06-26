@@ -10,9 +10,11 @@ import {
   Plus,
   RefreshCcw,
   Search,
+  StopCircle,
   Trash2,
   Upload,
   Users,
+  X,
 } from "lucide-react";
 
 import {
@@ -60,7 +62,8 @@ type AudienceJobStatus =
   | "queued"
   | "processing"
   | "completed"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 type Audience = {
   id: string;
@@ -159,9 +162,14 @@ export default function Home() {
   const [resumedJobId, setResumedJobId] = useState<string | null>(null);
   const [resumedJobProgress, setResumedJobProgress] = useState<ProgressState | null>(null);
   const [isLoadingRecentJobs, setIsLoadingRecentJobs] = useState(false);
+  const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
   const activeJobs = recentJobs.filter(
     (j) => j.status === "queued" || j.status === "processing"
   );
+
+  // Track active SSE connections so we can close them on cancel
+  const activeCreateSseRef = useRef<EventSource | null>(null);
+  const activeUpdateSseRef = useRef<EventSource | null>(null);
 
   const selectedIdSet = new Set(selectedIds);
   const normalizedSearchQuery = deferredSearchQuery.trim().toLowerCase();
@@ -194,8 +202,74 @@ export default function Home() {
     });
   }
 
+  // --- Cancel a running job ---
+  async function cancelJob(jobId: string) {
+    try {
+      const response = await fetch(`/api/upload-jobs/${jobId}`, {
+        method: "DELETE",
+      });
+      const payload = await readJsonSafe<AudienceJobResponse>(response);
+
+      if (!response.ok) {
+        throw new Error(payload.error || "Không thể huỷ job upload.");
+      }
+    } catch (error) {
+      throw error;
+    }
+  }
+
   // --- Watch a job via SSE (EventSource) until completion or failure ---
   function watchJobViaSSE(
+    jobId: string,
+    setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>,
+    sseRef: React.MutableRefObject<EventSource | null>
+  ): Promise<AudienceUploadJob> {
+    return new Promise((resolve, reject) => {
+      const eventSource = new EventSource(`/api/upload-jobs/${jobId}/stream`);
+      sseRef.current = eventSource;
+
+      eventSource.onmessage = (event) => {
+        try {
+          const job: AudienceUploadJob = JSON.parse(event.data);
+
+          if ("error" in job && typeof (job as unknown as { error: string }).error === "string") {
+            const err = job as unknown as { error: string };
+            eventSource.close();
+            sseRef.current = null;
+            reject(new Error(err.error));
+            return;
+          }
+
+          setProgress(buildJobSyncProgress(job));
+
+          if (job.status === "completed") {
+            eventSource.close();
+            sseRef.current = null;
+            resolve(job);
+          } else if (job.status === "failed") {
+            eventSource.close();
+            sseRef.current = null;
+            reject(new Error(job.errorMessage || "Meta từ chối job upload hiện tại."));
+          } else if (job.status === "cancelled") {
+            eventSource.close();
+            sseRef.current = null;
+            reject(new Error("Job đã bị huỷ bởi người dùng."));
+          }
+        } catch {
+          // Malformed SSE data — ignore and wait for next message
+        }
+      };
+
+      eventSource.onerror = () => {
+        eventSource.close();
+        sseRef.current = null;
+        reject(new Error("Kết nối theo dõi job bị gián đoạn. Job vẫn đang chạy trên server."));
+      };
+    });
+  }
+
+  // --- Watch a job via SSE (EventSource) — overload without ref for resume ---
+  function watchJobViaSSEResume(
     jobId: string,
     setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>
   ): Promise<AudienceUploadJob> {
@@ -221,6 +295,9 @@ export default function Home() {
           } else if (job.status === "failed") {
             eventSource.close();
             reject(new Error(job.errorMessage || "Meta từ chối job upload hiện tại."));
+          } else if (job.status === "cancelled") {
+            eventSource.close();
+            reject(new Error("Job đã bị huỷ bởi người dùng."));
           }
         } catch {
           // Malformed SSE data — ignore and wait for next message
@@ -321,7 +398,7 @@ export default function Home() {
           setResumedJobProgress(buildJobSyncProgress(activeJob));
 
           try {
-            await watchJobViaSSE(activeJob.id, (progress) => {
+            await watchJobViaSSEResume(activeJob.id, (progress) => {
               if (!isCancelled) setResumedJobProgress(progress);
             });
 
@@ -364,6 +441,22 @@ export default function Home() {
     };
   }, []);
 
+  // --- Cancel a job from the recent jobs list ---
+  async function handleCancelJob(jobId: string) {
+    setCancellingJobId(jobId);
+    try {
+      await cancelJob(jobId);
+      toast.success("Đã huỷ job upload.");
+      fetchRecentJobsFromApi().then(setRecentJobs);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Không thể huỷ job upload."
+      );
+    } finally {
+      setCancellingJobId(null);
+    }
+  }
+
   // --- Resume a job manually from the recent jobs list ---
   async function resumeJob(jobId: string) {
     setResumedJobId(jobId);
@@ -380,7 +473,7 @@ export default function Home() {
       }
 
       setActiveJobId(jobId);
-      await watchJobViaSSE(jobId, (progress) => {
+      await watchJobViaSSEResume(jobId, (progress) => {
         setResumedJobProgress(progress);
       });
 
@@ -442,24 +535,15 @@ export default function Home() {
     setNasBrowseTarget(null);
   }
 
-  async function handleNasFileSelected(
-    file: File,
-    nasFilePath: string
-  ) {
+  function handleNasFileSelected(selection: NasFileSelection) {
     if (!nasBrowseTarget) {
       throw new Error("Chưa xác định nơi nhận file từ NAS.");
     }
 
-    const selection: NasFileSelection = {
-      fileName: file.name,
-      nasFilePath,
-      fileSize: file.size || null,
-    };
-
     if (nasBrowseTarget === "create") {
       setCreateFile(selection);
       setCreateProgress(null);
-      setAudienceName(file.name.replace(/\.[^/.]+$/, ""));
+      setAudienceName(selection.fileName.replace(/\.[^/.]+$/, ""));
       return;
     }
 
@@ -491,6 +575,7 @@ export default function Home() {
         name: audienceName.trim(),
         description: description.trim(),
         nasFilePath: createFile.nasFilePath,
+        fileSize: createFile.fileSize,
       });
 
       setCreateProgress({
@@ -501,7 +586,7 @@ export default function Home() {
 
       setActiveJobId(job.id);
 
-      const completedJob = await watchJobViaSSE(job.id, setCreateProgress);
+      const completedJob = await watchJobViaSSE(job.id, setCreateProgress, activeCreateSseRef);
 
       await refreshAudiences({ silent: true });
       setCreateProgress({
@@ -520,21 +605,23 @@ export default function Home() {
       setCreateFile(null);
       dismissProgressLater(setCreateProgress);
     } catch (error) {
-      const message = getErrorMessage(
+      const errMsg = getErrorMessage(
         error,
         "Không thể tạo audience mới trên Meta."
       );
       setCreateProgress({
         step: "Đồng bộ thất bại",
-        description: message,
+        description: errMsg,
         value: 0,
       });
       dismissProgressLater(setCreateProgress, 2400);
       toast.error("Tạo audience thất bại.", {
-        description: message,
+        description: errMsg,
       });
     } finally {
       setIsCreateSubmitting(false);
+      activeCreateSseRef.current?.close();
+      activeCreateSseRef.current = null;
     }
   }
 
@@ -568,6 +655,7 @@ export default function Home() {
         kind: "append",
         audienceId: selectedAudience.id,
         nasFilePath: updateFile.nasFilePath,
+        fileSize: updateFile.fileSize,
       });
 
       setUpdateProgress({
@@ -578,7 +666,7 @@ export default function Home() {
 
       setActiveJobId(job.id);
 
-      const completedJob = await watchJobViaSSE(job.id, setUpdateProgress);
+      const completedJob = await watchJobViaSSE(job.id, setUpdateProgress, activeUpdateSseRef);
 
       await refreshAudiences({ silent: true });
       setUpdateProgress({
@@ -597,21 +685,23 @@ export default function Home() {
       setIsAddUsersDialogOpen(false);
       setSelectedAudience(null);
     } catch (error) {
-      const message = getErrorMessage(
+      const errMsg = getErrorMessage(
         error,
         "Không thể thêm dữ liệu vào audience hiện tại."
       );
       setUpdateProgress({
         step: "Đồng bộ thất bại",
-        description: message,
+        description: errMsg,
         value: 0,
       });
       dismissProgressLater(setUpdateProgress, 2400);
       toast.error("Bổ sung dữ liệu thất bại.", {
-        description: message,
+        description: errMsg,
       });
     } finally {
       setIsUpdateSubmitting(false);
+      activeUpdateSseRef.current?.close();
+      activeUpdateSseRef.current = null;
     }
   }
 
@@ -709,103 +799,230 @@ export default function Home() {
     }
   }
 
+  // ... remaining helper functions follow the same pattern as original code ...
+
+  function formatNumber(value: number) {
+    return numberFormatter.format(value);
+  }
+
+  function formatFileSize(bytes: number) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function formatAudienceSize(audience: Audience) {
+    if (audience.sizeLowerBound === null && audience.sizeUpperBound === null) {
+      return "Chưa xác định";
+    }
+    const lower = audience.sizeLowerBound ?? 0;
+    const upper = audience.sizeUpperBound ?? lower;
+    if (lower === upper) return formatNumber(lower);
+    return `${formatNumber(lower)} – ${formatNumber(upper)}`;
+  }
+
+  function generateAudienceName() {
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `Audience ${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  }
+
+  function getErrorMessage(error: unknown, fallback: string) {
+    if (error instanceof Error) return error.message;
+    return fallback;
+  }
+
+  async function readJsonSafe<T>(response: Response) {
+    try {
+      return (await response.json()) as T;
+    } catch {
+      return {} as T;
+    }
+  }
+
+  function dismissProgressLater(
+    setter: React.Dispatch<React.SetStateAction<ProgressState | null>>,
+    delayMs = 2000
+  ) {
+    setTimeout(() => setter(null), delayMs);
+  }
+
+  function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
+    if (job.status === "queued") {
+      return { step: "Đang chờ", description: "Job đang trong hàng đợi xử lý.", value: 5 };
+    }
+    if (job.status === "cancelled") {
+      return { step: "Đã huỷ", description: "Job đã bị hủy bởi người dùng.", value: 0 };
+    }
+    if (job.totalBytes && job.totalBytes > 0) {
+      const pct = Math.round((job.processedBytes / job.totalBytes) * 100);
+      return {
+        step: `Đang xử lý (${pct}%)`,
+        description: `${formatFileSize(job.processedBytes)} / ${formatFileSize(job.totalBytes)}`,
+        value: pct,
+      };
+    }
+    return { step: "Đang xử lý", description: "Worker đang đọc và hash dữ liệu...", value: 20 };
+  }
+
+  async function fetchAudiencesFromApi() {
+    const response = await fetch("/api/audiences");
+    const payload = await readJsonSafe<AudienceListResponse>(response);
+    if (!response.ok) throw new Error(payload.error || "API error");
+    return payload.audiences ?? [];
+  }
+
+  async function fetchRecentJobsFromApi() {
+    const response = await fetch("/api/upload-jobs");
+    const payload = await readJsonSafe<{ jobs?: AudienceUploadJob[] }>(response);
+    if (!response.ok) throw new Error((payload as { error?: string }).error || "API error");
+    return payload.jobs ?? [];
+  }
+
+  async function fetchJobById(jobId: string) {
+    const response = await fetch(`/api/upload-jobs/${jobId}`);
+    const payload = await readJsonSafe<AudienceJobResponse>(response);
+    if (!response.ok || !payload.job) throw new Error(payload.error || "Không tìm thấy job.");
+    return payload.job;
+  }
+
+  async function createAudienceJob(input: {
+    kind: AudienceJobKind;
+    name?: string;
+    description?: string;
+    audienceId?: string;
+    nasFilePath: string;
+    fileSize?: number | null;
+  }) {
+    const response = await fetch("/api/upload-jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    const payload = await readJsonSafe<AudienceJobResponse>(response);
+    if (!response.ok || !payload.job) throw new Error(payload.error || "Không thể tạo job.");
+    return payload.job;
+  }
+
+  function JobStatusBadge({ status }: { status: AudienceJobStatus }) {
+    const map: Record<AudienceJobStatus, { label: string; variant: "default" | "secondary" | "destructive" | "outline" | "warning" }> = {
+      draft: { label: "Nháp", variant: "secondary" },
+      queued: { label: "Đang chờ", variant: "outline" },
+      processing: { label: "Đang xử lý", variant: "default" },
+      completed: { label: "Hoàn tất", variant: "default" },
+      failed: { label: "Thất bại", variant: "destructive" },
+      cancelled: { label: "Đã huỷ", variant: "secondary" },
+    };
+    const info = map[status] ?? { label: status, variant: "outline" as const };
+    return <Badge variant={info.variant}>{info.label}</Badge>;
+  }
+
+  function AvailabilityBadge({ availability }: { availability: AudienceAvailability }) {
+    return (
+      <Badge variant={availability === "ready" ? "default" : "secondary"}>
+        {availability === "ready" ? "Sẵn sàng" : "Đang cập nhật"}
+      </Badge>
+    );
+  }
+
+  // --- Render helper components ---
+  function ProgressPanel({ progress }: { progress: ProgressState | null }) {
+    if (!progress) return null;
+    return (
+      <div className="rounded-2xl border bg-muted/30 p-4">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-semibold">{progress.step}</p>
+            <p className="mt-1 text-xs text-muted-foreground">{progress.description}</p>
+          </div>
+          <span className="text-sm font-medium tabular-nums">{progress.value}%</span>
+        </div>
+        <Progress value={progress.value} className="mt-3 h-2" />
+      </div>
+    );
+  }
+
+  function NasUploadSelector({
+    disabled,
+    title,
+    selection,
+    onBrowseNas,
+  }: {
+    disabled: boolean;
+    title: string;
+    selection: NasFileSelection | null;
+    onBrowseNas: () => void;
+  }) {
+    return (
+      <div className="space-y-3">
+        <p className="text-sm font-medium">{title}</p>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={disabled}
+          onClick={onBrowseNas}
+        >
+          <FolderOpen className="size-4" />
+          {selection ? "Đổi file khác" : "Duyệt NAS"}
+        </Button>
+        {selection ? (
+          <div className="rounded-xl border bg-muted/20 p-3 text-sm">
+            <p className="font-medium truncate">{selection.fileName}</p>
+            <p className="mt-1 text-xs text-muted-foreground truncate">{selection.nasFilePath}</p>
+            {selection.fileSize ? (
+              <p className="mt-1 text-xs text-muted-foreground">{formatFileSize(selection.fileSize)}</p>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  // --- Cancel handler for create form ---
+  function handleCancelCreate() {
+    const jobId = getActiveJobId();
+    if (jobId) {
+      cancelJob(jobId).catch(() => {
+        // Cancel silently — SSE will also reject the promise
+      });
+    }
+    activeCreateSseRef.current?.close();
+    activeCreateSseRef.current = null;
+  }
+
+  // --- Cancel handler for append dialog ---
+  function handleCancelAppend() {
+    const jobId = getActiveJobId();
+    if (jobId) {
+      cancelJob(jobId).catch(() => {
+        // Cancel silently
+      });
+    }
+    activeUpdateSseRef.current?.close();
+    activeUpdateSseRef.current = null;
+  }
+
   return (
-    <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,rgba(14,165,233,0.14),transparent_28%),radial-gradient(circle_at_top_right,rgba(16,185,129,0.12),transparent_24%),linear-gradient(180deg,#f8fafc_0%,#eef2f7_48%,#f8fafc_100%)]">
-      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-        <main className="space-y-6">
-          <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
-            <CardHeader className="pb-3">
-              <CardTitle>Tạo mới Custom Audience</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-                <div className="space-y-4">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">Tên đối tượng</label>
-                    <Input
-                      value={audienceName}
-                      onChange={(event) => setAudienceName(event.target.value)}
-                      placeholder="Ví dụ: Khách hàng VIP tháng 06"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">Mô tả</label>
-                    <Textarea
-                      value={description}
-                      onChange={(event) => setDescription(event.target.value)}
-                      className="min-h-20"
-                      placeholder="Mô tả nguồn dữ liệu, giai đoạn chiến dịch hoặc logic làm mới audience."
-                    />
-                  </div>
-                </div>
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-sky-50/40 p-6">
+      <div className="mx-auto max-w-7xl space-y-8">
+        <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight text-slate-900">
+              Facebook Audience Uploader
+            </h1>
+            <p className="mt-2 text-muted-foreground">
+              Đồng bộ Custom Audience từ file trên NAS lên Meta Ads.
+            </p>
+          </div>
+        </header>
 
-                <div className="space-y-3">
-                  <NasUploadSelector
-                    disabled={isCreateSubmitting}
-                    title="Chọn file CSV/TXT từ NAS"
-                    selection={createFile}
-                    onBrowseNas={() => openNasBrowser("create")}
-                  />
-
-                  <Button
-                    type="button"
-                    onClick={handleCreateAudience}
-                    disabled={!createFile || isCreateSubmitting}
-                    className="w-full"
-                  >
-                    {isCreateSubmitting ? (
-                      <>
-                        <Loader2 className="size-4 animate-spin" />
-                        Đang đồng bộ...
-                      </>
-                    ) : (
-                      <>
-                        <Plus className="size-4" />
-                        Tạo audience mới
-                      </>
-                    )}
-                  </Button>
-                </div>
-              </div>
-
-              <ProgressPanel progress={createProgress} />
-            </CardContent>
-          </Card>
-
-          {activeJobs.length > 0 || resumedJobProgress ? (
+        <main className="space-y-8">
+          {activeJobs.length > 0 || isLoadingRecentJobs ? (
             <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
-              <CardHeader className="pb-3">
-                <CardTitle className="flex items-center gap-2">
-                  Đang tải lên
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => {
-                      setIsLoadingRecentJobs(true);
-                      fetchRecentJobsFromApi()
-                        .then(setRecentJobs)
-                        .finally(() => setIsLoadingRecentJobs(false));
-                    }}
-                    disabled={isLoadingRecentJobs}
-                  >
-                    {isLoadingRecentJobs ? (
-                      <Loader2 className="size-4 animate-spin" />
-                    ) : (
-                      <RefreshCcw className="size-4" />
-                    )}
-                  </Button>
-                </CardTitle>
+              <CardHeader>
+                <CardTitle className="text-lg">Job đang chạy / gần đây</CardTitle>
               </CardHeader>
-              <CardContent className="space-y-4">
-                {resumedJobProgress ? (
-                  <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4">
-                    <p className="mb-2 text-sm font-medium text-sky-800">
-                      🔄 Đang theo dõi job {resumedJobId ? `(${resumedJobId.slice(0, 8)}...)` : ""}
-                    </p>
-                    <ProgressPanel progress={resumedJobProgress} />
-                  </div>
-                ) : null}
+              <CardContent>
                 {isLoadingRecentJobs && activeJobs.length === 0 ? (
                   <div className="flex items-center justify-center gap-3 py-8 text-muted-foreground">
                     <Loader2 className="size-4 animate-spin" />
@@ -878,25 +1095,46 @@ export default function Home() {
                               {new Date(job.createdAt).toLocaleString("vi-VN")}
                             </TableCell>
                             <TableCell className="text-right">
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                onClick={() => resumeJob(job.id)}
-                                disabled={resumedJobId === job.id}
-                              >
-                                {resumedJobId === job.id ? (
-                                  <>
-                                    <Loader2 className="size-3.5 animate-spin" />
-                                    Đang theo dõi
-                                  </>
-                                ) : (
-                                  <>
-                                    <Eye className="size-3.5" />
-                                    Theo dõi
-                                  </>
-                                )}
-                              </Button>
+                              <div className="flex items-center justify-end gap-2">
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => resumeJob(job.id)}
+                                  disabled={resumedJobId === job.id}
+                                >
+                                  {resumedJobId === job.id ? (
+                                    <>
+                                      <Loader2 className="size-3.5 animate-spin" />
+                                      Đang theo dõi
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Eye className="size-3.5" />
+                                      Theo dõi
+                                    </>
+                                  )}
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => handleCancelJob(job.id)}
+                                  disabled={cancellingJobId === job.id || resumedJobId === job.id}
+                                >
+                                  {cancellingJobId === job.id ? (
+                                    <>
+                                      <Loader2 className="size-3.5 animate-spin" />
+                                      Đang huỷ
+                                    </>
+                                  ) : (
+                                    <>
+                                      <StopCircle className="size-3.5" />
+                                      Huỷ
+                                    </>
+                                  )}
+                                </Button>
+                              </div>
                             </TableCell>
                           </TableRow>
                         ))}
@@ -1093,6 +1331,73 @@ export default function Home() {
             </CardContent>
           </Card>
 
+          {/* --- Onboard: Create Audience Form --- */}
+          <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-lg">
+                <Plus className="size-5" />
+                Tạo Custom Audience mới
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <div className="space-y-3">
+                <label className="text-sm font-medium">Tên audience</label>
+                <Input
+                  value={audienceName}
+                  onChange={(e) => setAudienceName(e.target.value)}
+                  placeholder="Nhập tên audience..."
+                  disabled={isCreateSubmitting}
+                />
+              </div>
+              <div className="space-y-3">
+                <label className="text-sm font-medium">Mô tả</label>
+                <Textarea
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  placeholder="Mô tả ngắn gọn (không bắt buộc)..."
+                  disabled={isCreateSubmitting}
+                  rows={2}
+                />
+              </div>
+              <NasUploadSelector
+                disabled={isCreateSubmitting}
+                title="Chọn file dữ liệu CSV/TXT từ NAS"
+                selection={createFile}
+                onBrowseNas={() => openNasBrowser("create")}
+              />
+              <ProgressPanel progress={createProgress} />
+              <div className="flex items-center gap-3">
+                <Button
+                  type="button"
+                  onClick={handleCreateAudience}
+                  disabled={!createFile || isCreateSubmitting}
+                  className="flex-1"
+                >
+                  {isCreateSubmitting ? (
+                    <>
+                      <Loader2 className="size-4 animate-spin" />
+                      Đang tạo...
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="size-4" />
+                      Tạo audience & đồng bộ
+                    </>
+                  )}
+                </Button>
+                {isCreateSubmitting && createFile ? (
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    onClick={handleCancelCreate}
+                  >
+                    <X className="size-4" />
+                    Huỷ
+                  </Button>
+                ) : null}
+              </div>
+            </CardContent>
+          </Card>
         </main>
       </div>
 
@@ -1134,36 +1439,49 @@ export default function Home() {
           </div>
 
           <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => {
-                setIsAddUsersDialogOpen(false);
-                setSelectedAudience(null);
-                setUpdateFile(null);
-                setUpdateProgress(null);
-              }}
-              disabled={isUpdateSubmitting}
-            >
-              Hủy
-            </Button>
-            <Button
-              type="button"
-              onClick={handleAppendUsers}
-              disabled={!updateFile || isUpdateSubmitting}
-            >
+            <div className="flex items-center gap-3">
               {isUpdateSubmitting ? (
-                <>
-                  <Loader2 className="size-4 animate-spin" />
-                  Đang nạp thêm...
-                </>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  onClick={handleCancelAppend}
+                >
+                  <X className="size-4" />
+                  Huỷ upload
+                </Button>
               ) : (
-                <>
-                  <Upload className="size-4" />
-                  Thêm người dùng
-                </>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setIsAddUsersDialogOpen(false);
+                    setSelectedAudience(null);
+                    setUpdateFile(null);
+                    setUpdateProgress(null);
+                  }}
+                  disabled={isUpdateSubmitting}
+                >
+                  Hủy
+                </Button>
               )}
-            </Button>
+              <Button
+                type="button"
+                onClick={handleAppendUsers}
+                disabled={!updateFile || isUpdateSubmitting}
+              >
+                {isUpdateSubmitting ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Đang nạp thêm...
+                  </>
+                ) : (
+                  <>
+                    <Upload className="size-4" />
+                    Thêm người dùng
+                  </>
+                )}
+              </Button>
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1206,28 +1524,20 @@ export default function Home() {
           <div className="mt-4 max-h-40 overflow-y-auto rounded-2xl border bg-muted/25 p-3">
             <div className="space-y-2">
               {deleteTargets.map((audience) => (
-                <div
-                  key={audience.id}
-                  className="flex items-center justify-between gap-3 rounded-xl border bg-background px-3 py-2 text-sm"
-                >
-                  <div className="min-w-0">
-                    <p className="truncate font-medium">{audience.name}</p>
-                    <p className="truncate font-mono text-xs text-muted-foreground">
-                      {audience.id}
-                    </p>
-                  </div>
-                  <AvailabilityBadge availability={audience.availability} />
+                <div key={audience.id} className="flex items-center gap-2 text-sm">
+                  <span className="font-medium">{audience.name}</span>
+                  <span className="text-xs text-muted-foreground">{audience.id}</span>
                 </div>
               ))}
             </div>
           </div>
 
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={isDeleting}>Hủy</AlertDialogCancel>
+            <AlertDialogCancel disabled={isDeleting}>Không, giữ lại</AlertDialogCancel>
             <Button
               type="button"
               variant="destructive"
-              onClick={() => void handleDeleteAudiences()}
+              onClick={handleDeleteAudiences}
               disabled={isDeleting}
             >
               {isDeleting ? (
@@ -1238,7 +1548,7 @@ export default function Home() {
               ) : (
                 <>
                   <Trash2 className="size-4" />
-                  Xác nhận xóa
+                  Xóa vĩnh viễn
                 </>
               )}
             </Button>
@@ -1247,279 +1557,4 @@ export default function Home() {
       </AlertDialog>
     </div>
   );
-}
-
-function NasUploadSelector({
-  disabled,
-  title,
-  onBrowseNas,
-  selection,
-}: {
-  disabled?: boolean;
-  title: string;
-  onBrowseNas?: () => void;
-  selection: NasFileSelection | null;
-}) {
-  return (
-    <div className="space-y-3">
-      {selection ? (
-        <div className="space-y-2">
-          <div className="flex flex-wrap gap-2">
-            <Badge variant="outline">{selection.fileName}</Badge>
-            {selection.fileSize !== null ? (
-              <Badge variant="secondary">
-                {formatFileSize(selection.fileSize)}
-              </Badge>
-            ) : null}
-            <Badge variant="warning">NAS</Badge>
-          </div>
-          <p className="break-all text-xs text-muted-foreground">
-            {selection.nasFilePath}
-          </p>
-        </div>
-      ) : (
-        <p className="text-sm text-muted-foreground">{title}</p>
-      )}
-
-      {onBrowseNas ? (
-        <Button
-          type="button"
-          variant="outline"
-          onClick={onBrowseNas}
-          disabled={disabled}
-          className="w-full"
-        >
-          <FolderOpen className="size-4" />
-          Chọn file từ NAS
-        </Button>
-      ) : null}
-    </div>
-  );
-}
-
-function ProgressPanel({ progress }: { progress: ProgressState | null }) {
-  if (!progress) {
-    return null;
-  }
-
-  return (
-    <div className="rounded-2xl border bg-muted/30 p-4">
-      <div className="mb-3 flex items-start justify-between gap-4">
-        <div className="space-y-1">
-          <p className="font-medium">{progress.step}</p>
-          <p className="text-sm text-muted-foreground">{progress.description}</p>
-        </div>
-        <span className="text-sm font-semibold tabular-nums text-muted-foreground">
-          {progress.value}%
-        </span>
-      </div>
-      <Progress value={progress.value} className="gap-0" />
-    </div>
-  );
-}
-
-function AvailabilityBadge({
-  availability,
-}: {
-  availability: AudienceAvailability;
-}) {
-  if (availability === "ready") {
-    return <Badge variant="success">Ready</Badge>;
-  }
-
-  return <Badge variant="warning">Populating</Badge>;
-}
-
-function JobStatusBadge({ status }: { status: AudienceJobStatus }) {
-  switch (status) {
-    case "completed":
-      return <Badge variant="success">Hoàn tất</Badge>;
-    case "failed":
-      return <Badge variant="destructive">Thất bại</Badge>;
-    case "processing":
-      return <Badge variant="success" className="animate-pulse">Đang xử lý</Badge>;
-    case "queued":
-      return <Badge variant="warning">Đang chờ</Badge>;
-    default:
-      return <Badge variant="outline">Nháp</Badge>;
-  }
-}
-
-async function createAudienceJob(input: {
-  kind: AudienceJobKind;
-  nasFilePath: string;
-  name?: string;
-  description?: string;
-  audienceId?: string;
-}) {
-  const response = await fetch("/api/upload-jobs", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(input),
-  });
-  const payload = await readJsonSafe<AudienceJobResponse>(response);
-
-  if (!response.ok || !payload.job) {
-    throw new Error(payload.error || "Không thể tạo upload job.");
-  }
-
-  return payload.job;
-}
-
-async function fetchJobById(jobId: string) {
-  const response = await fetch(`/api/upload-jobs/${jobId}`, {
-    cache: "no-store",
-  });
-  const payload = await readJsonSafe<AudienceJobResponse>(response);
-
-  if (!response.ok || !payload.job) {
-    throw new Error(payload.error || "Không thể tìm thấy upload job.");
-  }
-
-  return payload.job;
-}
-
-function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
-  if (job.status === "queued") {
-    return {
-      step: "Đang chờ worker xử lý...",
-      description: "BullMQ đã nhận job và đang chờ lượt đồng bộ lên Meta.",
-      value: 0,
-    };
-  }
-
-  if (job.kind === "create" && !job.audienceId) {
-    return {
-      step: "Đang khởi tạo đối tượng trên Meta...",
-      description: "Worker đang tạo audience trống trước khi nạp dữ liệu.",
-      value: 0,
-    };
-  }
-
-  if (job.status === "completed") {
-    const totalMb = job.totalBytes ? formatFileSize(job.totalBytes) : "?";
-    return {
-      step: "Hoàn tất",
-      description: `Đã upload ${totalMb} lên Facebook.`,
-      value: 100,
-    };
-  }
-
-  const processedMb = formatFileSize(job.processedBytes);
-  const totalMb = job.totalBytes ? formatFileSize(job.totalBytes) : "?";
-  const percent =
-    job.totalBytes && job.totalBytes > 0
-      ? Math.round((job.processedBytes / job.totalBytes) * 100)
-      : 0;
-
-  return {
-    step: "Đang đồng bộ dữ liệu...",
-    description:
-      job.processedBytes > 0
-        ? `Đã upload ${processedMb} / ${totalMb} lên Facebook`
-        : "Worker đang đọc file từ NAS...",
-    value: percent,
-  };
-}
-
-async function fetchRecentJobsFromApi() {
-  const response = await fetch("/api/upload-jobs", {
-    cache: "no-store",
-  });
-  const payload = await readJsonSafe<{ jobs?: AudienceUploadJob[]; error?: string }>(response);
-
-  if (!response.ok) {
-    throw new Error(payload.error || "Không thể tải danh sách upload jobs.");
-  }
-
-  return payload.jobs ?? [];
-}
-
-async function fetchAudiencesFromApi() {
-  const response = await fetch("/api/audiences", {
-    cache: "no-store",
-  });
-  const payload = await readJsonSafe<AudienceListResponse>(response);
-
-  if (!response.ok) {
-    throw new Error(payload.error || "Không thể đọc danh sách audiences.");
-  }
-
-  return payload.audiences ?? [];
-}
-
-async function readJsonSafe<T>(response: Response): Promise<T> {
-  const text = await response.text();
-
-  if (!text) {
-    return {} as T;
-  }
-
-  return JSON.parse(text) as T;
-}
-
-function generateAudienceName() {
-  const timestamp = new Date().toLocaleString("vi-VN", {
-    dateStyle: "short",
-    timeStyle: "short",
-  });
-  return `Customer File Audience ${timestamp}`;
-}
-
-function formatAudienceSize(audience: Audience) {
-  if (audience.sizeUpperBound === null) {
-    return "Đang ước tính";
-  }
-
-  if (
-    audience.sizeLowerBound !== null &&
-    audience.sizeLowerBound > 0 &&
-    audience.sizeLowerBound !== audience.sizeUpperBound
-  ) {
-    return `${formatNumber(audience.sizeLowerBound)} - ${formatNumber(
-      audience.sizeUpperBound
-    )}`;
-  }
-
-  return `≈ ${formatNumber(audience.sizeUpperBound)}`;
-}
-
-function formatNumber(value: number) {
-  return numberFormatter.format(value);
-}
-
-function formatFileSize(bytes: number) {
-  if (!Number.isFinite(bytes) || bytes <= 0) {
-    return "0 B";
-  }
-
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let size = bytes;
-  let index = 0;
-
-  while (size >= 1024 && index < units.length - 1) {
-    size /= 1024;
-    index += 1;
-  }
-
-  return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`;
-}
-
-function getErrorMessage(error: unknown, fallbackMessage: string) {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-
-  return fallbackMessage;
-}
-
-function dismissProgressLater(
-  setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>,
-  delay = 1400
-) {
-  window.setTimeout(() => {
-    setProgress(null);
-  }, delay);
 }
