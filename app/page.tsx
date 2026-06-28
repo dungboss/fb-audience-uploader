@@ -4,7 +4,7 @@ import { startTransition, useCallback, useDeferredValue, useEffect, useRef, useS
 import { toast } from "sonner";
 import {
   AlertCircle,
-  Eye,
+  Download,
   FolderOpen,
   Loader2,
   Plus,
@@ -14,7 +14,6 @@ import {
   Trash2,
   Upload,
   Users,
-  X,
 } from "lucide-react";
 
 import {
@@ -53,7 +52,8 @@ import { NasFileBrowserDialog } from "@/components/nas-file-browser-dialog";
 
 const numberFormatter = new Intl.NumberFormat("vi-VN");
 
-const ACTIVE_JOB_STORAGE_KEY = "audience-upload:active-job-id";
+// How often to refresh the job list while any job is queued/processing.
+const JOB_POLL_INTERVAL_MS = 2000;
 
 type AudienceAvailability = "ready" | "populating";
 type AudienceJobKind = "create" | "append";
@@ -160,17 +160,15 @@ export default function Home() {
   const [isDeleting, setIsDeleting] = useState(false);
 
   const [recentJobs, setRecentJobs] = useState<AudienceUploadJob[]>([]);
-  const [resumedJobId, setResumedJobId] = useState<string | null>(null);
-  const [resumedJobProgress, setResumedJobProgress] = useState<ProgressState | null>(null);
   const [isLoadingRecentJobs, setIsLoadingRecentJobs] = useState(false);
   const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
   const activeJobs = recentJobs.filter(
     (j) => j.status === "queued" || j.status === "processing"
   );
+  const activeJobCount = activeJobs.length;
 
-  // Track active SSE connections so we can close them on cancel
-  const activeCreateSseRef = useRef<EventSource | null>(null);
-  const activeUpdateSseRef = useRef<EventSource | null>(null);
+  // Jobs whose terminal status we've already surfaced (avoid re-toasting on poll).
+  const announcedDoneRef = useRef<Set<string>>(new Set());
 
   const selectedIdSet = new Set(selectedIds);
   const normalizedSearchQuery = deferredSearchQuery.trim().toLowerCase();
@@ -219,120 +217,6 @@ export default function Home() {
     }
   }
 
-  // --- Watch a job via SSE (EventSource) until completion or failure ---
-  function watchJobViaSSE(
-    jobId: string,
-    setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>,
-    sseRef: React.MutableRefObject<EventSource | null>
-  ): Promise<AudienceUploadJob> {
-    return new Promise((resolve, reject) => {
-      const eventSource = new EventSource(`/api/upload-jobs/${jobId}/stream`);
-      sseRef.current = eventSource;
-
-      eventSource.onmessage = (event) => {
-        try {
-          const job: AudienceUploadJob = JSON.parse(event.data);
-
-          if ("error" in job && typeof (job as unknown as { error: string }).error === "string") {
-            const err = job as unknown as { error: string };
-            eventSource.close();
-            sseRef.current = null;
-            reject(new Error(err.error));
-            return;
-          }
-
-          setProgress(buildJobSyncProgress(job));
-
-          if (job.status === "completed") {
-            eventSource.close();
-            sseRef.current = null;
-            resolve(job);
-          } else if (job.status === "failed") {
-            eventSource.close();
-            sseRef.current = null;
-            reject(new Error(job.errorMessage || "Meta từ chối job upload hiện tại."));
-          } else if (job.status === "cancelled") {
-            eventSource.close();
-            sseRef.current = null;
-            reject(new Error("Job đã bị huỷ bởi người dùng."));
-          }
-        } catch {
-          // Malformed SSE data — ignore and wait for next message
-        }
-      };
-
-      eventSource.onerror = () => {
-        eventSource.close();
-        sseRef.current = null;
-        reject(new Error("Kết nối theo dõi job bị gián đoạn. Job vẫn đang chạy trên server."));
-      };
-    });
-  }
-
-  // --- Watch a job via SSE (EventSource) — overload without ref for resume ---
-  function watchJobViaSSEResume(
-    jobId: string,
-    setProgress: React.Dispatch<React.SetStateAction<ProgressState | null>>
-  ): Promise<AudienceUploadJob> {
-    return new Promise((resolve, reject) => {
-      const eventSource = new EventSource(`/api/upload-jobs/${jobId}/stream`);
-
-      eventSource.onmessage = (event) => {
-        try {
-          const job: AudienceUploadJob = JSON.parse(event.data);
-
-          if ("error" in job && typeof (job as unknown as { error: string }).error === "string") {
-            const err = job as unknown as { error: string };
-            eventSource.close();
-            reject(new Error(err.error));
-            return;
-          }
-
-          setProgress(buildJobSyncProgress(job));
-
-          if (job.status === "completed") {
-            eventSource.close();
-            resolve(job);
-          } else if (job.status === "failed") {
-            eventSource.close();
-            reject(new Error(job.errorMessage || "Meta từ chối job upload hiện tại."));
-          } else if (job.status === "cancelled") {
-            eventSource.close();
-            reject(new Error("Job đã bị huỷ bởi người dùng."));
-          }
-        } catch {
-          // Malformed SSE data — ignore and wait for next message
-        }
-      };
-
-      eventSource.onerror = () => {
-        eventSource.close();
-        reject(new Error("Kết nối theo dõi job bị gián đoạn. Job vẫn đang chạy trên server."));
-      };
-    });
-  }
-
-  // --- LocalStorage helpers ---
-  function setActiveJobId(jobId: string | null) {
-    try {
-      if (jobId) {
-        window.localStorage.setItem(ACTIVE_JOB_STORAGE_KEY, jobId);
-      } else {
-        window.localStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
-      }
-    } catch {
-      // localStorage may be unavailable
-    }
-  }
-
-  function getActiveJobId(): string | null {
-    try {
-      return window.localStorage.getItem(ACTIVE_JOB_STORAGE_KEY);
-    } catch {
-      return null;
-    }
-  }
-
   // --- Bootstrap: load audiences ---
   useEffect(() => {
     let isCancelled = false;
@@ -374,64 +258,24 @@ export default function Home() {
     };
   }, []);
 
-  // --- Mount: restore active job via SSE + recent jobs list ---
+  // --- Mount: load recent jobs once ---
   useEffect(() => {
     let isCancelled = false;
 
     void (async () => {
       setIsLoadingRecentJobs(true);
-
       try {
         const jobs = await fetchRecentJobsFromApi();
         if (isCancelled) return;
-        setRecentJobs(jobs);
-
-        // Auto-restore any active job (queued/processing) from the API —
-        // works across browsers, machines, and after tab close/reopen.
-        const activeJob = jobs.find(
-          (j) => j.status === "queued" || j.status === "processing"
-        );
-
-        if (activeJob) {
-          // Persist for same-browser restore on quick reconnects
-          setActiveJobId(activeJob.id);
-          setResumedJobId(activeJob.id);
-          setResumedJobProgress(buildJobSyncProgress(activeJob));
-
-          try {
-            await watchJobViaSSEResume(activeJob.id, (progress) => {
-              if (!isCancelled) setResumedJobProgress(progress);
-            });
-
-            if (!isCancelled) {
-              await refreshAudiences({ silent: true });
-              dismissProgressLater(setResumedJobProgress, 2800);
-              toast.success("Job khôi phục đã hoàn tất.", {
-                description: `Job ${activeJob.name || activeJob.fileName} đã đồng bộ xong.`,
-              });
-              setActiveJobId(null);
-              fetchRecentJobsFromApi().then((nextJobs) => {
-                if (!isCancelled) setRecentJobs(nextJobs);
-              });
-            }
-          } catch {
-            if (!isCancelled) {
-              dismissProgressLater(setResumedJobProgress, 3200);
-              toast.error("Job khôi phục thất bại.");
-              setActiveJobId(null);
-              fetchRecentJobsFromApi().then((nextJobs) => {
-                if (!isCancelled) setRecentJobs(nextJobs);
-              });
-            }
-          } finally {
-            if (!isCancelled) setResumedJobId(null);
+        // Seed already-finished jobs so they don't toast on first load.
+        for (const job of jobs) {
+          if (job.status !== "queued" && job.status !== "processing") {
+            announcedDoneRef.current.add(job.id);
           }
-        } else {
-          // Clean up stale localStorage if job no longer active
-          setActiveJobId(null);
         }
+        setRecentJobs(jobs);
       } catch {
-        // Silently ignore — recent jobs is non-critical
+        // recent jobs is non-critical
       } finally {
         if (!isCancelled) setIsLoadingRecentJobs(false);
       }
@@ -442,56 +286,76 @@ export default function Home() {
     };
   }, []);
 
+  // --- Poll job statuses while any job is queued/processing ---
+  // This is the single source of truth for live job updates: it lets the user
+  // close the dialog right after queueing a file and still watch every job
+  // (đang đợi → đang up → xong) progress in the list as the worker drains them.
+  useEffect(() => {
+    if (activeJobCount === 0) return;
+    let isCancelled = false;
+
+    const interval = setInterval(() => {
+      void (async () => {
+        try {
+          const jobs = await fetchRecentJobsFromApi();
+          if (isCancelled) return;
+          setRecentJobs(jobs);
+
+          for (const job of jobs) {
+            if (
+              job.status === "completed" ||
+              job.status === "failed" ||
+              job.status === "cancelled"
+            ) {
+              if (announcedDoneRef.current.has(job.id)) continue;
+              announcedDoneRef.current.add(job.id);
+
+              if (job.status === "completed") {
+                toast.success("Đồng bộ xong.", {
+                  description: `${job.name || job.fileName}: ${formatNumber(job.syncedHashCount)} hash đã lên Meta.`,
+                });
+                void refreshAudiences({ silent: true });
+              } else if (job.status === "failed") {
+                toast.error("Job upload thất bại.", {
+                  description: job.errorMessage || job.name || job.fileName,
+                });
+              }
+            }
+          }
+        } catch {
+          // ignore transient poll errors
+        }
+      })();
+    }, JOB_POLL_INTERVAL_MS);
+
+    return () => {
+      isCancelled = true;
+      clearInterval(interval);
+    };
+  }, [activeJobCount]);
+
+  async function refreshRecentJobs() {
+    try {
+      setRecentJobs(await fetchRecentJobsFromApi());
+    } catch {
+      // non-critical
+    }
+  }
+
   // --- Cancel a job from the recent jobs list ---
   async function handleCancelJob(jobId: string) {
     setCancellingJobId(jobId);
     try {
       await cancelJob(jobId);
+      announcedDoneRef.current.add(jobId);
       toast.success("Đã huỷ job upload.");
-      fetchRecentJobsFromApi().then(setRecentJobs);
+      void refreshRecentJobs();
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Không thể huỷ job upload."
       );
     } finally {
       setCancellingJobId(null);
-    }
-  }
-
-  // --- Resume a job manually from the recent jobs list ---
-  async function resumeJob(jobId: string) {
-    setResumedJobId(jobId);
-
-    try {
-      const initial = await fetchJobById(jobId);
-      setResumedJobProgress(buildJobSyncProgress(initial));
-
-      if (initial.status === "completed" || initial.status === "failed") {
-        dismissProgressLater(setResumedJobProgress, 2800);
-        setResumedJobId(null);
-        fetchRecentJobsFromApi().then(setRecentJobs);
-        return;
-      }
-
-      setActiveJobId(jobId);
-      await watchJobViaSSEResume(jobId, (progress) => {
-        setResumedJobProgress(progress);
-      });
-
-      await refreshAudiences({ silent: true });
-      dismissProgressLater(setResumedJobProgress, 2800);
-      toast.success("Job đã hoàn tất.", {
-        description: `Job ${initial.name || initial.fileName} đã đồng bộ xong.`,
-      });
-      setActiveJobId(null);
-      fetchRecentJobsFromApi().then(setRecentJobs);
-    } catch {
-      dismissProgressLater(setResumedJobProgress, 3200);
-      toast.error("Job thất bại hoặc bị gián đoạn.");
-      setActiveJobId(null);
-      fetchRecentJobsFromApi().then(setRecentJobs);
-    } finally {
-      setResumedJobId(null);
     }
   }
 
@@ -571,12 +435,8 @@ export default function Home() {
       return;
     }
 
+    const fileName = createFile.fileName;
     setIsCreateSubmitting(true);
-    setCreateProgress({
-      step: "Đang khởi tạo job...",
-      description: "Server đang tạo upload job và enqueue vào worker.",
-      value: 8,
-    });
 
     try {
       const job = await createAudienceJob({
@@ -587,51 +447,25 @@ export default function Home() {
         fileSize: createFile.fileSize,
       });
 
-      setCreateProgress({
-        step: "Đang chờ worker xử lý...",
-        description: `Worker sẽ đọc file ${createFile.fileName} trực tiếp từ NAS, hash và gửi lên Meta.`,
-        value: 12,
+      // Queued — worker drains jobs one at a time. Close the dialog so the user
+      // can immediately queue another file; the list tracks progress live.
+      announcedDoneRef.current.delete(job.id);
+      await refreshRecentJobs();
+
+      toast.success("Đã thêm vào hàng đợi upload.", {
+        description: `${fileName} sẽ được xử lý lần lượt. Bạn có thể thêm file khác.`,
       });
 
-      setActiveJobId(job.id);
-
-      const completedJob = await watchJobViaSSE(job.id, setCreateProgress, activeCreateSseRef);
-
-      await refreshAudiences({ silent: true });
-      setCreateProgress({
-        step: "Hoàn tất",
-        description: `Audience ${completedJob.audienceId} đã nhận ${formatNumber(completedJob.syncedHashCount)} email hash.`,
-        value: 100,
-      });
-
-      toast.success("Tạo audience thành công.", {
-        description: `${formatNumber(completedJob.syncedHashCount)} hash đã được đồng bộ lên Meta.`,
-      });
-
-      setActiveJobId(null);
       setAudienceName(generateAudienceName());
       setDescription("");
       setCreateFile(null);
+      setCreateProgress(null);
       setIsCreateDialogOpen(false);
-      dismissProgressLater(setCreateProgress);
     } catch (error) {
-      const errMsg = getErrorMessage(
-        error,
-        "Không thể tạo audience mới trên Meta."
-      );
-      setCreateProgress({
-        step: "Đồng bộ thất bại",
-        description: errMsg,
-        value: 0,
-      });
-      dismissProgressLater(setCreateProgress, 2400);
-      toast.error("Tạo audience thất bại.", {
-        description: errMsg,
-      });
+      const errMsg = getErrorMessage(error, "Không thể tạo job upload.");
+      toast.error("Tạo job thất bại.", { description: errMsg });
     } finally {
       setIsCreateSubmitting(false);
-      activeCreateSseRef.current?.close();
-      activeCreateSseRef.current = null;
     }
   }
 
@@ -653,12 +487,8 @@ export default function Home() {
       return;
     }
 
+    const audienceLabel = selectedAudience.name;
     setIsUpdateSubmitting(true);
-    setUpdateProgress({
-      step: "Đang khởi tạo job...",
-      description: `Đang tạo job nạp thêm dữ liệu cho ${selectedAudience.name}.`,
-      value: 8,
-    });
 
     try {
       const job = await createAudienceJob({
@@ -668,50 +498,22 @@ export default function Home() {
         fileSize: updateFile.fileSize,
       });
 
-      setUpdateProgress({
-        step: "Đang chờ worker xử lý...",
-        description: `Worker sẽ đọc file từ NAS và nạp dần vào audience ${selectedAudience.id}.`,
-        value: 12,
+      announcedDoneRef.current.delete(job.id);
+      await refreshRecentJobs();
+
+      toast.success("Đã thêm vào hàng đợi upload.", {
+        description: `Nạp thêm vào ${audienceLabel} sẽ chạy lần lượt. Bạn có thể thêm file khác.`,
       });
 
-      setActiveJobId(job.id);
-
-      const completedJob = await watchJobViaSSE(job.id, setUpdateProgress, activeUpdateSseRef);
-
-      await refreshAudiences({ silent: true });
-      setUpdateProgress({
-        step: "Hoàn tất",
-        description: `${formatNumber(completedJob.syncedHashCount)} email hash đã được nạp thêm vào audience.`,
-        value: 100,
-      });
-
-      toast.success("Bổ sung dữ liệu thành công.", {
-        description: `${formatNumber(completedJob.syncedHashCount)} hash đã được gửi lên Meta.`,
-      });
-
-      setActiveJobId(null);
-      dismissProgressLater(setUpdateProgress);
       setUpdateFile(null);
+      setUpdateProgress(null);
       setIsAddUsersDialogOpen(false);
       setSelectedAudience(null);
     } catch (error) {
-      const errMsg = getErrorMessage(
-        error,
-        "Không thể thêm dữ liệu vào audience hiện tại."
-      );
-      setUpdateProgress({
-        step: "Đồng bộ thất bại",
-        description: errMsg,
-        value: 0,
-      });
-      dismissProgressLater(setUpdateProgress, 2400);
-      toast.error("Bổ sung dữ liệu thất bại.", {
-        description: errMsg,
-      });
+      const errMsg = getErrorMessage(error, "Không thể tạo job nạp thêm.");
+      toast.error("Tạo job thất bại.", { description: errMsg });
     } finally {
       setIsUpdateSubmitting(false);
-      activeUpdateSseRef.current?.close();
-      activeUpdateSseRef.current = null;
     }
   }
 
@@ -837,6 +639,53 @@ export default function Home() {
     return `Audience ${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
   }
 
+  // Quote a CSV field only when it contains a comma, quote, or newline.
+  function toCsvField(value: string) {
+    const v = value ?? "";
+    return /[",\n\r]/.test(v) ? `"${v.replaceAll('"', '""')}"` : v;
+  }
+
+  // Export the on-screen audience columns (name, id, description, status, size)
+  // to a UTF-8 CSV the browser downloads — no backend round-trip needed.
+  function exportAudiencesToCsv(list: Audience[]) {
+    if (list.length === 0) {
+      toast.error("Không có audience nào để xuất.");
+      return;
+    }
+
+    const headers = ["Tên đối tượng", "ID", "Mô tả", "Trạng thái", "Quy mô ước tính"];
+    const rows = list.map((audience) => [
+      audience.name,
+      audience.id,
+      audience.description || "",
+      audience.availability === "ready" ? "Sẵn sàng" : "Đang cập nhật",
+      formatAudienceSize(audience),
+    ]);
+
+    const csv = [headers, ...rows]
+      .map((cols) => cols.map(toCsvField).join(","))
+      .join("\r\n");
+
+    // Prepend BOM so Excel reads UTF-8 (Vietnamese) correctly.
+    const blob = new Blob(["﻿" + csv], {
+      type: "text/csv;charset=utf-8;",
+    });
+    const url = URL.createObjectURL(blob);
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const fileName = `audiences-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}.csv`;
+
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+
+    toast.success(`Đã xuất ${formatNumber(list.length)} audience ra CSV.`);
+  }
+
   function getErrorMessage(error: unknown, fallback: string) {
     if (error instanceof Error) return error.message;
     return fallback;
@@ -850,50 +699,19 @@ export default function Home() {
     }
   }
 
-  function dismissProgressLater(
-    setter: React.Dispatch<React.SetStateAction<ProgressState | null>>,
-    delayMs = 2000
-  ) {
-    setTimeout(() => setter(null), delayMs);
-  }
-
-  function buildJobSyncProgress(job: AudienceUploadJob): ProgressState {
-    if (job.status === "queued") {
-      return { step: "Đang chờ", description: "Job đang trong hàng đợi xử lý.", value: 5 };
-    }
-    if (job.status === "cancelled") {
-      return { step: "Đã huỷ", description: "Job đã bị hủy bởi người dùng.", value: 0 };
-    }
-    if (job.totalBytes && job.totalBytes > 0) {
-      const pct = Math.round((job.processedBytes / job.totalBytes) * 100);
-      return {
-        step: `Đang xử lý (${pct}%)`,
-        description: `${formatFileSize(job.processedBytes)} / ${formatFileSize(job.totalBytes)}`,
-        value: pct,
-      };
-    }
-    return { step: "Đang xử lý", description: "Worker đang đọc và hash dữ liệu...", value: 20 };
-  }
-
   async function fetchAudiencesFromApi() {
-    const response = await fetch("/api/audiences");
+    const response = await fetch("/api/audiences", { cache: "no-store" });
     const payload = await readJsonSafe<AudienceListResponse>(response);
     if (!response.ok) throw new Error(payload.error || "API error");
     return payload.audiences ?? [];
   }
 
   async function fetchRecentJobsFromApi() {
-    const response = await fetch("/api/upload-jobs");
+    // no-store: polling must always hit the network, not a cached response.
+    const response = await fetch("/api/upload-jobs", { cache: "no-store" });
     const payload = await readJsonSafe<{ jobs?: AudienceUploadJob[] }>(response);
     if (!response.ok) throw new Error((payload as { error?: string }).error || "API error");
     return payload.jobs ?? [];
-  }
-
-  async function fetchJobById(jobId: string) {
-    const response = await fetch(`/api/upload-jobs/${jobId}`);
-    const payload = await readJsonSafe<AudienceJobResponse>(response);
-    if (!response.ok || !payload.job) throw new Error(payload.error || "Không tìm thấy job.");
-    return payload.job;
   }
 
   async function createAudienceJob(input: {
@@ -986,30 +804,6 @@ export default function Home() {
         ) : null}
       </div>
     );
-  }
-
-  // --- Cancel handler for create form ---
-  function handleCancelCreate() {
-    const jobId = getActiveJobId();
-    if (jobId) {
-      cancelJob(jobId).catch(() => {
-        // Cancel silently — SSE will also reject the promise
-      });
-    }
-    activeCreateSseRef.current?.close();
-    activeCreateSseRef.current = null;
-  }
-
-  // --- Cancel handler for append dialog ---
-  function handleCancelAppend() {
-    const jobId = getActiveJobId();
-    if (jobId) {
-      cancelJob(jobId).catch(() => {
-        // Cancel silently
-      });
-    }
-    activeUpdateSseRef.current?.close();
-    activeUpdateSseRef.current = null;
   }
 
   return (
@@ -1110,28 +904,9 @@ export default function Home() {
                                   type="button"
                                   variant="outline"
                                   size="sm"
-                                  onClick={() => resumeJob(job.id)}
-                                  disabled={resumedJobId === job.id}
+                                  onClick={() => handleCancelJob(job.id)}
+                                  disabled={cancellingJobId === job.id}
                                 >
-                                  {resumedJobId === job.id ? (
-                                    <>
-                                      <Loader2 className="size-3.5 animate-spin" />
-                                      Đang theo dõi
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Eye className="size-3.5" />
-                                      Theo dõi
-                                    </>
-                                  )}
-                                </Button>
-                                  <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => handleCancelJob(job.id)}
-                                    disabled={cancellingJobId === job.id}
-                                  >
                                   {cancellingJobId === job.id ? (
                                     <>
                                       <Loader2 className="size-3.5 animate-spin" />
@@ -1199,6 +974,23 @@ export default function Home() {
                     <Button type="button" onClick={openCreateDialog}>
                       <Plus className="size-4" />
                       Tạo audience
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() =>
+                        exportAudiencesToCsv(
+                          selectedAudiences.length > 0
+                            ? selectedAudiences
+                            : filteredAudiences
+                        )
+                      }
+                      disabled={filteredAudiences.length === 0}
+                    >
+                      <Download className="size-4" />
+                      {selectedIds.length > 0
+                        ? `Xuất CSV (${selectedIds.length})`
+                        : "Xuất CSV"}
                     </Button>
                     <Button
                       type="button"
@@ -1415,29 +1207,18 @@ export default function Home() {
 
           <DialogFooter>
             <div className="flex items-center gap-3">
-              {isCreateSubmitting && createFile ? (
-                <Button
-                  type="button"
-                  variant="destructive"
-                  onClick={handleCancelCreate}
-                >
-                  <X className="size-4" />
-                  Huỷ upload
-                </Button>
-              ) : (
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
-                    setIsCreateDialogOpen(false);
-                    setCreateFile(null);
-                    setCreateProgress(null);
-                  }}
-                  disabled={isCreateSubmitting}
-                >
-                  Hủy
-                </Button>
-              )}
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  setIsCreateDialogOpen(false);
+                  setCreateFile(null);
+                  setCreateProgress(null);
+                }}
+                disabled={isCreateSubmitting}
+              >
+                Đóng
+              </Button>
               <Button
                 type="button"
                 onClick={handleCreateAudience}
@@ -1446,12 +1227,12 @@ export default function Home() {
                 {isCreateSubmitting ? (
                   <>
                     <Loader2 className="size-4 animate-spin" />
-                    Đang tạo...
+                    Đang thêm...
                   </>
                 ) : (
                   <>
                     <Upload className="size-4" />
-                    Tạo audience & đồng bộ
+                    Đưa vào hàng đợi
                   </>
                 )}
               </Button>
@@ -1499,30 +1280,19 @@ export default function Home() {
 
           <DialogFooter>
             <div className="flex items-center gap-3">
-              {isUpdateSubmitting ? (
-                <Button
-                  type="button"
-                  variant="destructive"
-                  onClick={handleCancelAppend}
-                >
-                  <X className="size-4" />
-                  Huỷ upload
-                </Button>
-              ) : (
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
-                    setIsAddUsersDialogOpen(false);
-                    setSelectedAudience(null);
-                    setUpdateFile(null);
-                    setUpdateProgress(null);
-                  }}
-                  disabled={isUpdateSubmitting}
-                >
-                  Hủy
-                </Button>
-              )}
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  setIsAddUsersDialogOpen(false);
+                  setSelectedAudience(null);
+                  setUpdateFile(null);
+                  setUpdateProgress(null);
+                }}
+                disabled={isUpdateSubmitting}
+              >
+                Đóng
+              </Button>
               <Button
                 type="button"
                 onClick={handleAppendUsers}
@@ -1531,12 +1301,12 @@ export default function Home() {
                 {isUpdateSubmitting ? (
                   <>
                     <Loader2 className="size-4 animate-spin" />
-                    Đang nạp thêm...
+                    Đang thêm...
                   </>
                 ) : (
                   <>
                     <Upload className="size-4" />
-                    Thêm người dùng
+                    Đưa vào hàng đợi
                   </>
                 )}
               </Button>

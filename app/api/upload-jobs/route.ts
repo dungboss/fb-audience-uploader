@@ -12,7 +12,10 @@ export async function GET() {
   try {
     const jobs = await listRecentAudienceUploadJobs();
 
-    return NextResponse.json({ jobs });
+    return NextResponse.json(
+      { jobs },
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (error) {
     const safeError = getClientSafeError(
       error,
