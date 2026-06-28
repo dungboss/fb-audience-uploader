@@ -133,6 +133,7 @@ export default function Home() {
   const [createFile, setCreateFile] = useState<NasFileSelection | null>(null);
   const [createProgress, setCreateProgress] = useState<ProgressState | null>(null);
   const [isCreateSubmitting, setIsCreateSubmitting] = useState(false);
+  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
 
   const [audiences, setAudiences] = useState<Audience[]>([]);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
@@ -551,6 +552,14 @@ export default function Home() {
     setUpdateProgress(null);
   }
 
+  function openCreateDialog() {
+    setAudienceName(generateAudienceName());
+    setDescription("");
+    setCreateFile(null);
+    setCreateProgress(null);
+    setIsCreateDialogOpen(true);
+  }
+
   async function handleCreateAudience() {
     if (!createFile) {
       toast.error("Hãy chọn file dữ liệu trước khi đồng bộ.");
@@ -603,6 +612,7 @@ export default function Home() {
       setAudienceName(generateAudienceName());
       setDescription("");
       setCreateFile(null);
+      setIsCreateDialogOpen(false);
       dismissProgressLater(setCreateProgress);
     } catch (error) {
       const errMsg = getErrorMessage(
@@ -1115,13 +1125,13 @@ export default function Home() {
                                     </>
                                   )}
                                 </Button>
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => handleCancelJob(job.id)}
-                                  disabled={cancellingJobId === job.id || resumedJobId === job.id}
-                                >
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => handleCancelJob(job.id)}
+                                    disabled={cancellingJobId === job.id}
+                                  >
                                   {cancellingJobId === job.id ? (
                                     <>
                                       <Loader2 className="size-3.5 animate-spin" />
@@ -1148,9 +1158,17 @@ export default function Home() {
 
           <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
             <CardHeader className="gap-4">
-              <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-end">
+              <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                <CardTitle className="flex items-center gap-2 text-lg">
+                  Danh sách Custom Audiences
+                  {!isBootstrapping ? (
+                    <Badge variant="secondary">
+                      {formatNumber(filteredAudiences.length)}
+                    </Badge>
+                  ) : null}
+                </CardTitle>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-                  <div className="relative w-full sm:min-w-80">
+                  <div className="relative w-full sm:min-w-72">
                     <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
                       value={searchQuery}
@@ -1159,33 +1177,39 @@ export default function Home() {
                       placeholder="Tìm kiếm theo tên hoặc ID audience"
                     />
                   </div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => void refreshAudiences({ silent: true })}
-                    disabled={isRefreshing || isBootstrapping}
-                  >
-                    {isRefreshing ? (
-                      <>
-                        <Loader2 className="size-4 animate-spin" />
-                        Đang tải...
-                      </>
-                    ) : (
-                      <>
-                        <RefreshCcw className="size-4" />
-                        Làm mới
-                      </>
-                    )}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    onClick={() => promptDelete(selectedAudiences)}
-                    disabled={selectedIds.length === 0 || isDeleting}
-                  >
-                    <Trash2 className="size-4" />
-                    Xóa đã chọn
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => void refreshAudiences({ silent: true })}
+                      disabled={isRefreshing || isBootstrapping}
+                    >
+                      {isRefreshing ? (
+                        <>
+                          <Loader2 className="size-4 animate-spin" />
+                          Đang tải...
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCcw className="size-4" />
+                          Làm mới
+                        </>
+                      )}
+                    </Button>
+                    <Button type="button" onClick={openCreateDialog}>
+                      <Plus className="size-4" />
+                      Tạo audience
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      onClick={() => promptDelete(selectedAudiences)}
+                      disabled={selectedIds.length === 0 || isDeleting}
+                    >
+                      <Trash2 className="size-4" />
+                      Xóa đã chọn
+                    </Button>
+                  </div>
                 </div>
               </div>
             </CardHeader>
@@ -1331,75 +1355,110 @@ export default function Home() {
             </CardContent>
           </Card>
 
-          {/* --- Onboard: Create Audience Form --- */}
-          <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-lg">
-                <Plus className="size-5" />
-                Tạo Custom Audience mới
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-5">
-              <div className="space-y-3">
-                <label className="text-sm font-medium">Tên audience</label>
-                <Input
-                  value={audienceName}
-                  onChange={(e) => setAudienceName(e.target.value)}
-                  placeholder="Nhập tên audience..."
-                  disabled={isCreateSubmitting}
-                />
-              </div>
-              <div className="space-y-3">
-                <label className="text-sm font-medium">Mô tả</label>
-                <Textarea
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  placeholder="Mô tả ngắn gọn (không bắt buộc)..."
-                  disabled={isCreateSubmitting}
-                  rows={2}
-                />
-              </div>
-              <NasUploadSelector
-                disabled={isCreateSubmitting}
-                title="Chọn file dữ liệu CSV/TXT từ NAS"
-                selection={createFile}
-                onBrowseNas={() => openNasBrowser("create")}
-              />
-              <ProgressPanel progress={createProgress} />
-              <div className="flex items-center gap-3">
-                <Button
-                  type="button"
-                  onClick={handleCreateAudience}
-                  disabled={!createFile || isCreateSubmitting}
-                  className="flex-1"
-                >
-                  {isCreateSubmitting ? (
-                    <>
-                      <Loader2 className="size-4 animate-spin" />
-                      Đang tạo...
-                    </>
-                  ) : (
-                    <>
-                      <Upload className="size-4" />
-                      Tạo audience & đồng bộ
-                    </>
-                  )}
-                </Button>
-                {isCreateSubmitting && createFile ? (
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    onClick={handleCancelCreate}
-                  >
-                    <X className="size-4" />
-                    Huỷ
-                  </Button>
-                ) : null}
-              </div>
-            </CardContent>
-          </Card>
         </main>
       </div>
+
+      <Dialog
+        open={isCreateDialogOpen}
+        onOpenChange={(open) => {
+          if (isCreateSubmitting) {
+            return;
+          }
+
+          setIsCreateDialogOpen(open);
+          if (!open) {
+            setCreateFile(null);
+            setCreateProgress(null);
+          }
+        }}
+        disablePointerDismissal={isCreateSubmitting}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Plus className="size-5" />
+              Tạo Custom Audience mới
+            </DialogTitle>
+            <DialogDescription>
+              Tạo audience mới và đồng bộ EMAIL_SHA256 từ file CSV/TXT trên NAS lên Meta.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="mt-5 space-y-5">
+            <div className="space-y-3">
+              <label className="text-sm font-medium">Tên audience</label>
+              <Input
+                value={audienceName}
+                onChange={(e) => setAudienceName(e.target.value)}
+                placeholder="Nhập tên audience..."
+                disabled={isCreateSubmitting}
+              />
+            </div>
+            <div className="space-y-3">
+              <label className="text-sm font-medium">Mô tả</label>
+              <Textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Mô tả ngắn gọn (không bắt buộc)..."
+                disabled={isCreateSubmitting}
+                rows={2}
+              />
+            </div>
+            <NasUploadSelector
+              disabled={isCreateSubmitting}
+              title="Chọn file dữ liệu CSV/TXT từ NAS"
+              selection={createFile}
+              onBrowseNas={() => openNasBrowser("create")}
+            />
+            <ProgressPanel progress={createProgress} />
+          </div>
+
+          <DialogFooter>
+            <div className="flex items-center gap-3">
+              {isCreateSubmitting && createFile ? (
+                <Button
+                  type="button"
+                  variant="destructive"
+                  onClick={handleCancelCreate}
+                >
+                  <X className="size-4" />
+                  Huỷ upload
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setIsCreateDialogOpen(false);
+                    setCreateFile(null);
+                    setCreateProgress(null);
+                  }}
+                  disabled={isCreateSubmitting}
+                >
+                  Hủy
+                </Button>
+              )}
+              <Button
+                type="button"
+                onClick={handleCreateAudience}
+                disabled={!createFile || isCreateSubmitting}
+              >
+                {isCreateSubmitting ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Đang tạo...
+                  </>
+                ) : (
+                  <>
+                    <Upload className="size-4" />
+                    Tạo audience & đồng bộ
+                  </>
+                )}
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={isAddUsersDialogOpen}
