@@ -50,3 +50,23 @@ export async function enqueueAudienceUploadJob(jobId: string) {
     }
   );
 }
+
+// Drop a job from the queue so a cancelled job is never (re)processed.
+// A waiting/delayed job is removed outright; an active (locked) job can't be
+// removed by BullMQ — the worker stops it cooperatively via the Redis status.
+export async function removeAudienceUploadJob(jobId: string) {
+  const queue = getAudienceUploadQueue();
+  const job = await queue.getJob(jobId);
+
+  if (!job) {
+    return false;
+  }
+
+  try {
+    await job.remove();
+    return true;
+  } catch {
+    // Job is active/locked — leave it; worker will abort on next cancel check.
+    return false;
+  }
+}

@@ -1,5 +1,6 @@
 import path from "node:path";
 
+import { resilientFetch } from "@/lib/resilient-fetch";
 import {
   getWebDavParentPath,
   normalizeWebDavPath,
@@ -8,6 +9,15 @@ import {
 } from "@/lib/webdav";
 
 const DEFAULT_WEBDAV_BASE_URL = "https://nas-api.batmedia.info/";
+
+// Thrown when the server ignores a Range request and returns the full file
+// (HTTP 200 instead of 206), so callers can fall back to streaming the body.
+export class WebDavRangeUnsupportedError extends Error {
+  constructor() {
+    super("WebDAV server ignored Range request (returned 200).");
+    this.name = "WebDavRangeUnsupportedError";
+  }
+}
 
 type WebDavConfig = {
   baseUrl: string;
@@ -179,12 +189,19 @@ export async function fetchWebDavFileHead(
 ): Promise<{ contentLength: number | null; contentType: string | null }> {
   const normalizedPath = normalizeWebDavPath(requestedPath);
 
-  const response = await fetch(buildWebDavUrl(normalizedPath, false), {
-    method: "HEAD",
-    headers: {
-      ...getWebDavAuthHeaders(),
+  const response = await resilientFetch(
+    buildWebDavUrl(normalizedPath, false),
+    {
+      method: "HEAD",
+      headers: {
+        ...getWebDavAuthHeaders(),
+        // Force uncompressed: Cloudflare/Brotli on-the-fly drops Content-Length.
+        // identity makes the NAS return the real size and raw byte offsets.
+        "Accept-Encoding": "identity",
+      },
     },
-  });
+    { label: "webdav-head" }
+  );
 
   if (!response.ok) {
     throw new Error(`WebDAV HEAD failed (${response.status})`);
@@ -203,13 +220,25 @@ export async function fetchWebDavFileRange(
 ): Promise<ArrayBuffer> {
   const normalizedPath = normalizeWebDavPath(requestedPath);
 
-  const response = await fetch(buildWebDavUrl(normalizedPath, false), {
-    method: "GET",
-    headers: {
-      ...getWebDavAuthHeaders(),
-      Range: `bytes=${start}-${end}`,
+  const response = await resilientFetch(
+    buildWebDavUrl(normalizedPath, false),
+    {
+      method: "GET",
+      headers: {
+        ...getWebDavAuthHeaders(),
+        // Avoid compressed ranges so byte offsets map 1:1 to the raw file.
+        "Accept-Encoding": "identity",
+        Range: `bytes=${start}-${end}`,
+      },
     },
-  });
+    { label: "webdav-range" }
+  );
+
+  if (response.status === 200) {
+    // Server ignored Range and is returning the whole file — don't buffer it.
+    await response.body?.cancel().catch(() => {});
+    throw new WebDavRangeUnsupportedError();
+  }
 
   if (!response.ok && response.status !== 206) {
     throw new Error(
@@ -260,6 +289,11 @@ async function ensureWebDavParentDirectory(
   }
 }
 
+// Fallback for servers that don't support Range. Intentionally a bare fetch
+// with NO timeout: consumer backpressure (paced to Meta's ~10k/s) keeps this
+// connection open for the whole upload, so a per-request timeout would cut a
+// healthy long read. A mid-stream drop surfaces as a transient error and is
+// recovered by the worker's job-level retry + line-count resume.
 export async function fetchWebDavFileStream(
   requestedPath: string
 ): Promise<ReadableStream<Uint8Array>> {
@@ -269,6 +303,8 @@ export async function fetchWebDavFileStream(
     method: "GET",
     headers: {
       ...getWebDavAuthHeaders(),
+      // Uncompressed so bytesRead matches the real file size for progress.
+      "Accept-Encoding": "identity",
     },
   });
 

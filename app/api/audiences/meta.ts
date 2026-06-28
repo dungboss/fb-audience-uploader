@@ -1,3 +1,5 @@
+import { resilientFetch } from "@/lib/resilient-fetch";
+
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const DEFAULT_FACEBOOK_API_VERSION = "v23.0";
 const FACEBOOK_GRAPH_BASE_URL = "https://graph.facebook.com";
@@ -343,14 +345,18 @@ async function facebookRequest<T>(
     url.searchParams.set(key, value);
   }
 
-  const response = await fetch(url, {
-    ...init,
-    cache: "no-store",
-    headers: {
-      Accept: "application/json",
-      ...(init.headers ?? {}),
+  const response = await resilientFetch(
+    url,
+    {
+      ...init,
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        ...(init.headers ?? {}),
+      },
     },
-  });
+    { label: "meta-graph" }
+  );
 
   return parseFacebookResponse<T>(response);
 }

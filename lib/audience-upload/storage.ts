@@ -4,6 +4,7 @@ import {
   fetchWebDavFileHead,
   fetchWebDavFileRange,
   fetchWebDavFileStream,
+  WebDavRangeUnsupportedError,
 } from "@/lib/webdav.server";
 
 const NAS_CHUNK_BYTES = 10 * 1024 * 1024; // 10 MB per range request
@@ -42,17 +43,29 @@ export async function* streamNasFileLines(
 ): AsyncGenerator<StreamChunk, void, void> {
   const head = await fetchWebDavFileHead(nasFilePath);
 
-  // Prefer PROPFIND size over HEAD Content-Length for progress display
-  const knownSize = options.knownSize ?? head.contentLength;
+  // Drive range requests by HEAD Content-Length when present, otherwise by the
+  // PROPFIND size (knownSize). Large files often omit Content-Length on HEAD but
+  // still support Range — using knownSize keeps them on the resilient, resumable
+  // 10MB-per-request path instead of one fragile long-lived stream.
+  const totalBytes = head.contentLength ?? options.knownSize ?? null;
 
-  // When server returns Content-Length, use range requests (efficient, resumable)
-  if (head.contentLength !== null) {
-    yield* streamViaRangeRequests(nasFilePath, head.contentLength);
-    return;
+  if (totalBytes !== null && totalBytes > 0) {
+    try {
+      yield* streamViaRangeRequests(nasFilePath, totalBytes);
+      return;
+    } catch (error) {
+      if (!(error instanceof WebDavRangeUnsupportedError)) {
+        throw error;
+      }
+      // Server ignored Range (returned 200) — fall through to full-read streaming.
+      console.warn(
+        `[storage] NAS ignored Range for ${nasFilePath}; falling back to full read.`
+      );
+    }
   }
 
-  // Fallback: server didn't return Content-Length — stream the whole file
-  yield* streamViaFullRead(nasFilePath, knownSize);
+  // Fallback: no size known, or server doesn't support Range — stream the file.
+  yield* streamViaFullRead(nasFilePath);
 }
 
 async function* streamViaRangeRequests(
@@ -100,8 +113,7 @@ async function* streamViaRangeRequests(
 }
 
 async function* streamViaFullRead(
-  nasFilePath: string,
-  knownSize: number | null
+  nasFilePath: string
 ): AsyncGenerator<StreamChunk, void, void> {
   const stream = await fetchWebDavFileStream(nasFilePath);
   const reader = stream.getReader();
@@ -113,7 +125,7 @@ async function* streamViaFullRead(
       if (done) break;
 
       const chunkBytes = value.byteLength;
-      let chunk = new TextDecoder("utf-8", { fatal: false }).decode(value);
+      const chunk = new TextDecoder("utf-8", { fatal: false }).decode(value);
 
       // Prepend leftover from previous chunk boundary
       const text = leftover + chunk;

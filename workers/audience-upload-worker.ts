@@ -1,4 +1,4 @@
-import { Worker } from "bullmq";
+import { UnrecoverableError, Worker } from "bullmq";
 
 import {
   createEmptyAudience,
@@ -20,9 +20,12 @@ import {
   getNasFileMeta,
   streamNasFileLines,
 } from "../lib/audience-upload/storage";
+import {
+  describeFetchError,
+  isTransientFetchError,
+} from "../lib/resilient-fetch";
 import type { AudienceUploadJobPayload } from "../lib/audience-upload/types";
 
-const FACEBOOK_MAX_HASHES_PER_SECOND = 10_000;
 const DEFAULT_RETRY_DELAY_MS = 5_000;
 const META_REQUEST_THROTTLE_KEY = "audience-upload:meta-request-throttle";
 
@@ -42,6 +45,19 @@ async function main() {
         };
       }
 
+      // Honor cancellation: never resurrect a cancelled job back to processing.
+      if (uploadJob.status === "cancelled") {
+        console.info(
+          `[audience-upload-worker] job ${jobId} already cancelled, skipping.`
+        );
+        return {
+          jobId,
+          audienceId: uploadJob.audienceId,
+          syncedHashCount: uploadJob.syncedHashCount,
+          cancelled: true,
+        };
+      }
+
       await patchAudienceUploadJob(jobId, {
         status: "processing",
         errorMessage: "",
@@ -51,80 +67,125 @@ async function main() {
 
       let audienceId = uploadJob.audienceId;
 
-      // Create audience if needed
-      if (uploadJob.kind === "create" && !audienceId) {
-        const createdAudience = await retryMetaAware(() =>
-          createEmptyAudience({
-            name: uploadJob.name,
-            description: uploadJob.description,
-          })
-        );
-
-        audienceId = createdAudience.id;
-        await patchAudienceUploadJob(jobId, {
-          audienceId,
-          status: "processing",
-          updatedAt: new Date().toISOString(),
-        });
-      }
-
-      if (!audienceId) {
-        throw new Error("Worker chưa có audienceId để sync dữ liệu lên Meta.");
-      }
-
-      // Get file metadata
-      const fileMeta = await getNasFileMeta(uploadJob.nasFilePath);
-      console.info(
-        `[audience-upload-worker] nas file ${uploadJob.nasFilePath}, content-length=${fileMeta.contentLength} (jobId=${jobId})`
-      );
-
-      // Sync hashes while streaming from NAS
-      // Prefer fileSize from PROPFIND (NAS browser) over Content-Length from HEAD
-      const totalBytes = uploadJob.fileSize ?? fileMeta.contentLength ?? 0;
-      const result = await syncLinesFromNas(
-        audienceId,
-        uploadJob.nasFilePath,
-        totalBytes,
-        jobId,
-        async (progress) => {
-          await patchAudienceUploadJob(jobId, {
-            processedLines: progress.processedLines,
-            processedBytes: progress.processedBytes,
-            syncedHashCount: progress.syncedHashCount,
-            syncedLines: progress.syncedLines,
-            totalBytes: totalBytes > 0 ? totalBytes : null,
-            lastSessionId: progress.lastSessionId,
-            updatedAt: new Date().toISOString(),
-          });
-
-          await bullJob.updateProgress({
-            processedLines: progress.processedLines,
-            processedBytes: progress.processedBytes,
-            totalBytes: totalBytes > 0 ? totalBytes : undefined,
-            syncedHashCount: progress.syncedHashCount,
-          });
-        }
-      );
-
-      // Final update
-      await patchAudienceUploadJob(jobId, {
-        processedLines: result.processedLines,
-        processedBytes: result.processedBytes,
-        syncedHashCount: result.syncedHashCount,
-        syncedLines: result.syncedLines,
-        totalLines: result.processedLines,
-        totalBytes: totalBytes > 0 ? totalBytes : null,
-        lastSessionId: result.lastSessionId,
-        updatedAt: new Date().toISOString(),
-      });
-
-      uploadJob = await markAudienceUploadJobCompleted(jobId);
-
-      return {
-        jobId,
-        audienceId: uploadJob.audienceId,
+      // Resume point: lines already confirmed-synced to Meta in a previous
+      // attempt. On a BullMQ retry these counts survive in Redis, so we re-read
+      // the file but skip re-sending them and continue where we left off.
+      const resume = {
+        syncedLines: uploadJob.syncedLines,
         syncedHashCount: uploadJob.syncedHashCount,
       };
+      if (resume.syncedLines > 0) {
+        console.info(
+          `[audience-upload-worker] resuming job ${jobId} from line ${resume.syncedLines} (already synced).`
+        );
+      }
+
+      try {
+        // Create audience if needed (skipped on retry — audienceId is persisted).
+        if (uploadJob.kind === "create" && !audienceId) {
+          const createdAudience = await retryMetaAware(() =>
+            createEmptyAudience({
+              name: uploadJob.name,
+              description: uploadJob.description,
+            })
+          );
+
+          audienceId = createdAudience.id;
+          await patchAudienceUploadJob(jobId, {
+            audienceId,
+            status: "processing",
+            updatedAt: new Date().toISOString(),
+          });
+        }
+
+        if (!audienceId) {
+          throw new Error("Worker chưa có audienceId để sync dữ liệu lên Meta.");
+        }
+
+        // Get file metadata
+        const fileMeta = await getNasFileMeta(uploadJob.nasFilePath);
+        console.info(
+          `[audience-upload-worker] nas file ${uploadJob.nasFilePath}, content-length=${fileMeta.contentLength} (jobId=${jobId})`
+        );
+
+        // Sync hashes while streaming from NAS
+        // Prefer fileSize from PROPFIND (NAS browser) over Content-Length from HEAD
+        const totalBytes = uploadJob.fileSize ?? fileMeta.contentLength ?? 0;
+
+        const result = await syncLinesFromNas(
+          audienceId,
+          uploadJob.nasFilePath,
+          totalBytes,
+          resume,
+          async (progress) => {
+            // Cooperative cancel: stop streaming/uploading if the job was cancelled.
+            if (await isJobCancelled(jobId)) {
+              throw new JobCancelledError();
+            }
+
+            await patchAudienceUploadJob(jobId, {
+              processedLines: progress.processedLines,
+              processedBytes: progress.processedBytes,
+              syncedHashCount: progress.syncedHashCount,
+              syncedLines: progress.syncedLines,
+              totalBytes: totalBytes > 0 ? totalBytes : null,
+              lastSessionId: progress.lastSessionId,
+              updatedAt: new Date().toISOString(),
+            });
+
+            await bullJob.updateProgress({
+              processedLines: progress.processedLines,
+              processedBytes: progress.processedBytes,
+              totalBytes: totalBytes > 0 ? totalBytes : undefined,
+              syncedHashCount: progress.syncedHashCount,
+            });
+          }
+        );
+
+        // Final update
+        await patchAudienceUploadJob(jobId, {
+          processedLines: result.processedLines,
+          processedBytes: result.processedBytes,
+          syncedHashCount: result.syncedHashCount,
+          syncedLines: result.syncedLines,
+          totalLines: result.processedLines,
+          totalBytes: totalBytes > 0 ? totalBytes : null,
+          lastSessionId: result.lastSessionId,
+          updatedAt: new Date().toISOString(),
+        });
+
+        uploadJob = await markAudienceUploadJobCompleted(jobId);
+
+        return {
+          jobId,
+          audienceId: uploadJob.audienceId,
+          syncedHashCount: uploadJob.syncedHashCount,
+        };
+      } catch (error) {
+        // Cancelled mid-flight: keep the cancelled status, return normally so
+        // BullMQ treats it as done (no retry, no failed status).
+        if (error instanceof JobCancelledError) {
+          await patchAudienceUploadJob(jobId, {
+            status: "cancelled",
+            updatedAt: new Date().toISOString(),
+          });
+          console.info(
+            `[audience-upload-worker] job ${jobId} cancelled mid-flight, stopping.`
+          );
+          return { jobId, audienceId, cancelled: true };
+        }
+
+        // Retryable: transient connection drop or Meta rate limit → let BullMQ retry.
+        if (isTransientFetchError(error) || isMetaRateLimitRetryError(error)) {
+          throw error;
+        }
+
+        // Genuine, non-recoverable error (bad token, deleted audience, invalid
+        // data...) → fail fast instead of looping all 168 attempts.
+        throw new UnrecoverableError(
+          error instanceof Error ? error.message : String(error)
+        );
+      }
     },
     {
       connection: getBullConnectionOptions(),
@@ -165,7 +226,7 @@ async function main() {
     const maxAttempts = bullJob?.opts?.attempts ?? 1;
 
     console.error(
-      `[audience-upload-worker] failed ${bullJobId} (jobId=${jobId}, attempts=${attemptsMade}/${maxAttempts}): ${error.message}`,
+      `[audience-upload-worker] failed ${bullJobId} (jobId=${jobId}, attempts=${attemptsMade}/${maxAttempts}): ${describeFetchError(error)}`,
       error.stack ? `\n${error.stack}` : ""
     );
 
@@ -219,35 +280,42 @@ async function syncLinesFromNas(
   audienceId: string,
   nasFilePath: string,
   totalBytes: number,
-  jobId: string,
+  resume: { syncedLines: number; syncedHashCount: number },
   onProgress: (progress: SyncProgress) => Promise<void>
 ) {
+  // metaBatchSize is configurable via UPLOAD_META_BATCH_SIZE (Meta documents 10,000/call).
   const { metaBatchSize, metaRequestIntervalMs } = getAudienceUploadConfig();
-  const effectiveBatchSize = Math.min(
-    metaBatchSize,
-    FACEBOOK_MAX_HASHES_PER_SECOND
-  );
+
+  // Lines already uploaded in a previous attempt: re-read but don't re-send.
+  const resumeFromLine = resume.syncedLines;
 
   let processedLines = 0;
   let processedBytes = 0;
-  let syncedHashCount = 0;
-  let syncedLines = 0;
+  let syncedHashCount = resume.syncedHashCount;
+  let syncedLines = resume.syncedLines;
   let lastSessionId: string | null = null;
 
   // Accumulate hashes across stream yields until we reach batch size
-  let accumulator: string[] = [];
+  const accumulator: string[] = [];
 
   for await (const { hashes, bytesRead } of streamNasFileLines(
     nasFilePath,
     { knownSize: totalBytes > 0 ? totalBytes : null }
   )) {
-    processedLines += hashes.length;
     processedBytes += bytesRead;
-    accumulator.push(...hashes);
+
+    for (const hash of hashes) {
+      processedLines += 1;
+      // Skip hashes confirmed-synced in a prior run — Meta already has them.
+      if (processedLines <= resumeFromLine) {
+        continue;
+      }
+      accumulator.push(hash);
+    }
 
     // Flush accumulator in batches
-    while (accumulator.length >= effectiveBatchSize) {
-      const batch = accumulator.splice(0, effectiveBatchSize);
+    while (accumulator.length >= metaBatchSize) {
+      const batch = accumulator.splice(0, metaBatchSize);
 
       await acquireMetaRequestSlot(metaRequestIntervalMs);
 
@@ -311,13 +379,17 @@ async function retryMetaAware<T>(callback: () => Promise<T>) {
   }
 }
 
+// Global rate gate shared across workers: a self-expiring Redis key enforces a
+// minimum `intervalMs` between Meta requests. The key auto-expires after
+// `intervalMs`, so the next acquirer either grabs it (NX) or sleeps for exactly
+// the remaining TTL before retrying.
 async function acquireMetaRequestSlot(intervalMs: number) {
   const redis = getRedis();
 
   while (true) {
     const acquired = await redis.set(
       META_REQUEST_THROTTLE_KEY,
-      String(Date.now()),
+      "1",
       "PX",
       intervalMs,
       "NX"
@@ -327,8 +399,8 @@ async function acquireMetaRequestSlot(intervalMs: number) {
       return;
     }
 
-    const retryAfterMs = await redis.pttl(META_REQUEST_THROTTLE_KEY);
-    await waitFor(retryAfterMs > 0 ? retryAfterMs : 100);
+    const remainingTtlMs = await redis.pttl(META_REQUEST_THROTTLE_KEY);
+    await waitFor(remainingTtlMs > 0 ? remainingTtlMs : 100);
   }
 }
 
@@ -339,6 +411,19 @@ class MetaRateLimitRetryError extends Error {
   }
 }
 
+// Thrown to unwind the stream loop when a job is cancelled while processing.
+class JobCancelledError extends Error {
+  constructor() {
+    super("Job đã bị huỷ bởi người dùng.");
+    this.name = "JobCancelledError";
+  }
+}
+
+async function isJobCancelled(jobId: string) {
+  const job = await getAudienceUploadJob(jobId);
+  return job.status === "cancelled";
+}
+
 function isMetaRateLimitRetryError(error: unknown) {
   return error instanceof Error && error.name === "MetaRateLimitRetryError";
 }
@@ -347,8 +432,17 @@ function shouldRetryLater(
   bullJob: { attemptsMade: number; opts: { attempts?: number } },
   error: Error
 ) {
+  // Fail-fast errors are terminal — never re-queue them.
+  if (error instanceof UnrecoverableError) {
+    return false;
+  }
+
   const maxAttempts = bullJob.opts.attempts ?? 1;
-  return isMetaRateLimitRetryError(error) && bullJob.attemptsMade < maxAttempts;
+  // Re-queue both Meta rate limits and transient connection drops
+  // (undici "terminated", ECONNRESET, socket timeout) instead of failing hard.
+  const retryable =
+    isMetaRateLimitRetryError(error) || isTransientFetchError(error);
+  return retryable && bullJob.attemptsMade < maxAttempts;
 }
 
 function buildRetryMessage(error: Error) {
@@ -357,6 +451,10 @@ function buildRetryMessage(error: Error) {
       Date.now() + getAudienceUploadConfig().metaRateLimitDelayMs
     ).toLocaleString("vi-VN");
     return `Facebook dang gioi han toc do. Worker se gui tiep sau ${retryAt}.`;
+  }
+
+  if (isTransientFetchError(error)) {
+    return `Ket noi bi gian doan (${describeFetchError(error)}). Worker se thu lai.`;
   }
 
   return error.message;

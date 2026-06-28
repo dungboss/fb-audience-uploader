@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { getClientSafeError } from "@/app/api/audiences/meta";
 import { cancelAudienceUploadJob, getAudienceUploadJob } from "@/lib/audience-upload/jobs";
+import { removeAudienceUploadJob } from "@/lib/audience-upload/queue";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -41,6 +42,8 @@ export async function DELETE(
   try {
     const { jobId } = await params;
     const job = await cancelAudienceUploadJob(jobId);
+    // Remove from the queue so the worker never picks up / re-runs a cancelled job.
+    await removeAudienceUploadJob(jobId);
 
     return NextResponse.json({ job });
   } catch (error) {
