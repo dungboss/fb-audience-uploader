@@ -3,6 +3,13 @@ import { FacebookApiError } from "@/app/api/audiences/meta";
 const DEFAULT_QUEUE_NAME = "audience-upload-sync";
 const DEFAULT_SHARD_TEMP_DIR = "/temp/fb-audience-uploader";
 
+// Hashes sent per Meta request. Meta documents a 10,000-per-call limit, but the
+// effective batch is configurable via env (UPLOAD_META_BATCH_SIZE) so it can be
+// tuned without a code change — raise to test a higher limit, lower if rejected.
+const DEFAULT_META_BATCH_SIZE = 10_000;
+// Throughput ceiling in hashes/second used to derive request spacing.
+const DEFAULT_META_MAX_HASHES_PER_SECOND = 10_000;
+
 export interface AudienceUploadConfig {
   redisUrl: string;
   queueName: string;
@@ -16,6 +23,7 @@ export interface AudienceUploadConfig {
   metaRequestIntervalMs: number;
   metaRateLimitDelayMs: number;
   metaBatchSize: number;
+  metaMaxHashesPerSecond: number;
   webdavUsername?: string;
   webdavPassword?: string;
 }
@@ -28,6 +36,28 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
   }
 
   const redisUrl = readRequiredEnv("REDIS_URL");
+
+  // Hashes sent per Meta request; tune freely via env (Meta documents 10,000/call).
+  const metaBatchSize = readNumberEnv(
+    "UPLOAD_META_BATCH_SIZE",
+    DEFAULT_META_BATCH_SIZE
+  );
+  // Throughput ceiling: never push more than this many hashes/second to Meta.
+  const metaMaxHashesPerSecond = readNumberEnv(
+    "UPLOAD_META_MAX_PER_SEC",
+    DEFAULT_META_MAX_HASHES_PER_SECOND
+  );
+  // Spacing between requests is derived from the rate ceiling: one batch of
+  // `metaBatchSize` every `interval` ms must not exceed `metaMaxHashesPerSecond`.
+  // Legacy UPLOAD_META_REQUEST_INTERVAL_MS still overrides when set explicitly.
+  const derivedRequestIntervalMs = Math.max(
+    1,
+    Math.round((metaBatchSize / metaMaxHashesPerSecond) * 1_000)
+  );
+  const metaRequestIntervalMs = readNumberEnv(
+    "UPLOAD_META_REQUEST_INTERVAL_MS",
+    derivedRequestIntervalMs
+  );
 
   cachedConfig = {
     redisUrl,
@@ -43,15 +73,13 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
       "UPLOAD_WORKER_RATE_LIMIT_DURATION_MS",
       1_000
     ),
-    metaRequestIntervalMs: readNumberEnv(
-      "UPLOAD_META_REQUEST_INTERVAL_MS",
-      1_000
-    ),
+    metaRequestIntervalMs,
     metaRateLimitDelayMs: readNumberEnv(
       "UPLOAD_META_RATE_LIMIT_DELAY_MS",
       60 * 60 * 1_000
     ),
-    metaBatchSize: readNumberEnv("UPLOAD_META_BATCH_SIZE", 10_000),
+    metaBatchSize,
+    metaMaxHashesPerSecond,
     webdavUsername: readOptionalEnv("WEBDAV_USERNAME"),
     webdavPassword: readOptionalEnv("WEBDAV_PASSWORD"),
   };
