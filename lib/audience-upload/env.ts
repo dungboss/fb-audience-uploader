@@ -24,6 +24,9 @@ export interface AudienceUploadConfig {
   metaRateLimitDelayMs: number;
   metaBatchSize: number;
   metaMaxHashesPerSecond: number;
+  // Proactively pause (for metaRateLimitDelayMs) after this many bytes uploaded
+  // in one run, to self-pace under Meta limits. 0 disables.
+  proactivePauseBytes: number;
   webdavUsername?: string;
   webdavPassword?: string;
 }
@@ -59,6 +62,12 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
     derivedRequestIntervalMs
   );
 
+  // Proactive pause threshold in bytes. Default 1 GB; "0" disables it.
+  const proactivePauseRaw = readOptionalEnv("UPLOAD_META_PROACTIVE_PAUSE_BYTES");
+  const proactivePauseBytes = proactivePauseRaw
+    ? Math.max(0, Number.parseInt(proactivePauseRaw, 10) || 0)
+    : 1024 * 1024 * 1024;
+
   cachedConfig = {
     redisUrl,
     queueName: readOptionalEnv("UPLOAD_JOB_QUEUE_NAME") ?? DEFAULT_QUEUE_NAME,
@@ -80,6 +89,7 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
     ),
     metaBatchSize,
     metaMaxHashesPerSecond,
+    proactivePauseBytes,
     webdavUsername: readOptionalEnv("WEBDAV_USERNAME"),
     webdavPassword: readOptionalEnv("WEBDAV_PASSWORD"),
   };

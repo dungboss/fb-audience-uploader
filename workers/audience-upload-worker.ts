@@ -297,10 +297,14 @@ async function syncLinesFromNas(
   onProgress: (progress: SyncProgress) => Promise<void>
 ) {
   // metaBatchSize is configurable via UPLOAD_META_BATCH_SIZE (Meta documents 10,000/call).
-  const { metaBatchSize, metaRequestIntervalMs } = getAudienceUploadConfig();
+  const { metaBatchSize, metaRequestIntervalMs, proactivePauseBytes } =
+    getAudienceUploadConfig();
 
   // Lines already uploaded in a previous attempt: re-read but don't re-send.
   const resumeFromLine = resume.syncedLines;
+  // Bytes already confirmed-uploaded at the start of THIS run — the proactive
+  // pause measures new bytes uploaded since here.
+  const runBaseOffset = resume.syncedByteOffset;
 
   let processedLines = 0;
   let processedBytes = 0;
@@ -370,6 +374,22 @@ async function syncLinesFromNas(
         syncedByteOffset,
         lastSessionId,
       });
+
+      // Proactive self-pacing: after ~N bytes uploaded in this run, pause (1h)
+      // and resume from the saved offset. Progress was just persisted above, so
+      // the retry continues cleanly. Reuses the rate-limit wait+resume path.
+      if (
+        proactivePauseBytes > 0 &&
+        syncedByteOffset - runBaseOffset >= proactivePauseBytes
+      ) {
+        const uploadedGb = (
+          (syncedByteOffset - runBaseOffset) /
+          (1024 * 1024 * 1024)
+        ).toFixed(2);
+        throw new MetaRateLimitRetryError(
+          `Da up ${uploadedGb} GB trong phien nay — chu dong nghi roi up tiep.`
+        );
+      }
     }
   }
 
