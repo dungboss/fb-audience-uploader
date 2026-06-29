@@ -6,9 +6,13 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
-    const audiences = await listAudiences();
+    const searchParams = new URL(request.url).searchParams;
+    const audiences = await listAudiences({
+      tokenId: searchParams.get("tokenId") ?? undefined,
+      adAccountId: searchParams.get("adAccountId") ?? undefined,
+    });
     return NextResponse.json({ audiences });
   } catch (error) {
     const safeError = getClientSafeError(
@@ -34,6 +38,8 @@ export async function POST(request: Request) {
       name?: unknown;
       description?: unknown;
       hashedEmails?: unknown;
+      adAccountId?: unknown;
+      tokenId?: unknown;
     };
 
     const result = await createAudience({
@@ -41,6 +47,9 @@ export async function POST(request: Request) {
       description:
         typeof body.description === "string" ? body.description : undefined,
       hashedEmails: body.hashedEmails,
+      adAccountId:
+        typeof body.adAccountId === "string" ? body.adAccountId : undefined,
+      tokenId: typeof body.tokenId === "string" ? body.tokenId : undefined,
     });
 
     return NextResponse.json(result, { status: 201 });

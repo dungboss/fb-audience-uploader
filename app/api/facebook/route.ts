@@ -12,6 +12,7 @@ export async function POST(request: Request) {
       audienceName?: unknown;
       description?: unknown;
       hashedEmails?: unknown;
+      adAccountId?: unknown;
     };
 
     const result = await createAudience({
@@ -20,6 +21,8 @@ export async function POST(request: Request) {
       description:
         typeof body.description === "string" ? body.description : undefined,
       hashedEmails: body.hashedEmails,
+      adAccountId:
+        typeof body.adAccountId === "string" ? body.adAccountId : undefined,
     });
 
     return NextResponse.json({

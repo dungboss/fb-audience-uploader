@@ -42,6 +42,8 @@ export async function POST(request: Request) {
       description?: unknown;
       nasFilePath?: unknown;
       audienceId?: unknown;
+      adAccountId?: unknown;
+      tokenId?: unknown;
       fileSize?: unknown;
     };
 
@@ -54,6 +56,9 @@ export async function POST(request: Request) {
         typeof body.nasFilePath === "string" ? body.nasFilePath : "",
       audienceId:
         typeof body.audienceId === "string" ? body.audienceId : undefined,
+      adAccountId:
+        typeof body.adAccountId === "string" ? body.adAccountId : undefined,
+      tokenId: typeof body.tokenId === "string" ? body.tokenId : undefined,
       fileSize:
         typeof body.fileSize === "number" ? body.fileSize : undefined,
     });

@@ -1,4 +1,15 @@
+import { createHmac } from "node:crypto";
+
+import {
+  FacebookApiError,
+  type MetaApiErrorPayload,
+} from "@/lib/audience-upload/facebook-error";
+import { getFbTokenCredentials } from "@/lib/audience-upload/token-store";
 import { resilientFetch } from "@/lib/resilient-fetch";
+
+// Re-exported so existing `import { FacebookApiError } from "@/app/api/audiences/meta"`
+// call sites keep working after the type moved to its own module.
+export { FacebookApiError };
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const DEFAULT_FACEBOOK_API_VERSION = "v23.0";
@@ -17,10 +28,30 @@ export interface AudienceListItem {
   timeUpdated: string | null;
 }
 
-interface FacebookConfig {
+export interface AdAccountListItem {
+  id: string; // act_<id> — use this for Graph API paths
+  accountId: string; // numeric id without the act_ prefix
+  name: string;
+  accountStatus: number | null;
+  currency: string | null;
+}
+
+interface FacebookCredentials {
   accessToken: string;
-  adAccountId: string;
   apiVersion: string;
+  // app secret backing the token; when present every call carries an
+  // appsecret_proof. null when the token was stored without one.
+  appSecret: string | null;
+}
+
+// Selects which access token a Meta call uses. `tokenId` references a stored
+// (encrypted) token in Redis; `token` (+ optional `appSecret`) is a raw pair
+// used only to validate a freshly-added token. All omitted → fall back to
+// FACEBOOK_ACCESS_TOKEN in .env.
+export interface FacebookCredentialOptions {
+  tokenId?: string;
+  token?: string;
+  appSecret?: string;
 }
 
 interface MetaAudience {
@@ -39,6 +70,19 @@ interface MetaAudienceListResponse {
   data?: MetaAudience[];
 }
 
+interface MetaAdAccount {
+  id?: string;
+  account_id?: string;
+  name?: string;
+  account_status?: number | string;
+  currency?: string;
+}
+
+interface MetaAdAccountListResponse {
+  data?: MetaAdAccount[];
+  paging?: { next?: string };
+}
+
 interface MetaAudienceCreateResponse {
   id: string;
 }
@@ -53,14 +97,6 @@ interface MetaDeleteResponse {
   success?: boolean;
 }
 
-interface MetaApiErrorPayload {
-  message?: string;
-  type?: string;
-  code?: number;
-  error_subcode?: number;
-  fbtrace_id?: string;
-}
-
 type MetaStatus =
   | string
   | {
@@ -70,18 +106,6 @@ type MetaStatus =
     }
   | null
   | undefined;
-
-export class FacebookApiError extends Error {
-  readonly status: number;
-  readonly details?: MetaApiErrorPayload;
-
-  constructor(message: string, status = 500, details?: MetaApiErrorPayload) {
-    super(message);
-    this.name = "FacebookApiError";
-    this.status = status;
-    this.details = details;
-  }
-}
 
 export function getClientSafeError(
   error: unknown,
@@ -149,8 +173,72 @@ export function validateHashedEmails(input: unknown): string[] {
   return Array.from(new Set(normalizedHashes));
 }
 
-export async function listAudiences(): Promise<AudienceListItem[]> {
-  const { adAccountId } = getFacebookConfig();
+// Lists every ad account the access token can reach (Graph `me/adaccounts`),
+// following pagination so accounts beyond the first page are included. Lets the
+// UI offer a picker instead of hardcoding FACEBOOK_AD_ACCOUNT_ID in .env.
+export async function listAdAccounts(
+  options?: FacebookCredentialOptions
+): Promise<AdAccountListItem[]> {
+  const credentials = await resolveCredentials(options);
+  const fields = ["account_id", "name", "account_status", "currency"].join(",");
+
+  // First page goes through the shared helper (token + api version + parsing).
+  let page = await facebookRequest<MetaAdAccountListResponse>(
+    "me/adaccounts",
+    {
+      method: "GET",
+      query: { fields, limit: "200" },
+    },
+    credentials
+  );
+
+  const items: AdAccountListItem[] = [];
+  let guard = 0;
+
+  while (true) {
+    for (const account of page.data ?? []) {
+      const mapped = mapAdAccount(account);
+      if (mapped) {
+        items.push(mapped);
+      }
+    }
+
+    const next = page.paging?.next;
+    if (!next || guard >= 25) {
+      break;
+    }
+    guard += 1;
+
+    // `next` is an absolute Graph URL already carrying access_token + cursor;
+    // re-attach appsecret_proof (it isn't preserved in the paging link).
+    const nextUrl = new URL(next);
+    const proof = computeAppSecretProof(
+      credentials.accessToken,
+      credentials.appSecret
+    );
+    if (proof) {
+      nextUrl.searchParams.set("appsecret_proof", proof);
+    }
+
+    const response = await resilientFetch(
+      nextUrl,
+      {
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      },
+      { label: "meta-adaccounts" }
+    );
+    page = await parseFacebookResponse<MetaAdAccountListResponse>(response);
+  }
+
+  return items.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export async function listAudiences(
+  options?: FacebookCredentialOptions & { adAccountId?: string }
+): Promise<AudienceListItem[]> {
+  const credentials = await resolveCredentials(options);
+  const adAccountId = resolveAdAccountId(options?.adAccountId);
   const response = await facebookRequest<MetaAudienceListResponse>(
     `${adAccountId}/customaudiences`,
     {
@@ -169,7 +257,8 @@ export async function listAudiences(): Promise<AudienceListItem[]> {
         ].join(","),
         limit: "200",
       },
-    }
+    },
+    credentials
   );
 
   return (response.data ?? [])
@@ -185,6 +274,8 @@ export async function createAudience(input: {
   name: string;
   description?: string;
   hashedEmails: unknown;
+  adAccountId?: string;
+  tokenId?: string;
 }) {
   const name = input.name.trim();
   const hashedEmails = validateHashedEmails(input.hashedEmails);
@@ -195,8 +286,12 @@ export async function createAudience(input: {
   const createdAudience = await createEmptyAudience({
     name,
     description: input.description,
+    adAccountId: input.adAccountId,
+    tokenId: input.tokenId,
   });
-  const uploadResult = await uploadHashedUsers(createdAudience.id, hashedEmails);
+  const uploadResult = await uploadHashedUsers(createdAudience.id, hashedEmails, {
+    tokenId: input.tokenId,
+  });
 
   return {
     audienceId: createdAudience.id,
@@ -209,6 +304,7 @@ export async function createAudience(input: {
 export async function addUsersToAudience(input: {
   audienceId: string;
   hashedEmails: unknown;
+  tokenId?: string;
 }) {
   const audienceId = input.audienceId.trim();
   const hashedEmails = validateHashedEmails(input.hashedEmails);
@@ -217,7 +313,9 @@ export async function addUsersToAudience(input: {
     throw new FacebookApiError("Audience ID không hợp lệ.", 400);
   }
 
-  const uploadResult = await uploadHashedUsers(audienceId, hashedEmails);
+  const uploadResult = await uploadHashedUsers(audienceId, hashedEmails, {
+    tokenId: input.tokenId,
+  });
 
   return {
     audienceId,
@@ -230,8 +328,11 @@ export async function addUsersToAudience(input: {
 export async function createEmptyAudience(input: {
   name: string;
   description?: string;
+  adAccountId?: string;
+  tokenId?: string;
 }) {
-  const { adAccountId } = getFacebookConfig();
+  const credentials = await resolveCredentials({ tokenId: input.tokenId });
+  const adAccountId = resolveAdAccountId(input.adAccountId);
   const name = input.name.trim();
   const description = input.description?.trim() ?? "";
 
@@ -253,7 +354,8 @@ export async function createEmptyAudience(input: {
     {
       method: "POST",
       body: createFormData,
-    }
+    },
+    credentials
   );
 
   return {
@@ -263,7 +365,8 @@ export async function createEmptyAudience(input: {
 
 export async function uploadHashedUsers(
   audienceId: string,
-  hashedEmails: unknown
+  hashedEmails: unknown,
+  options?: FacebookCredentialOptions
 ) {
   const normalizedAudienceId = audienceId.trim();
   const normalizedHashes = validateHashedEmails(hashedEmails);
@@ -272,19 +375,28 @@ export async function uploadHashedUsers(
     throw new FacebookApiError("Audience ID không hợp lệ.", 400);
   }
 
-  return uploadAudienceUsers(normalizedAudienceId, normalizedHashes);
+  const credentials = await resolveCredentials(options);
+  return uploadAudienceUsers(normalizedAudienceId, normalizedHashes, credentials);
 }
 
-export async function deleteAudience(audienceId: string) {
+export async function deleteAudience(
+  audienceId: string,
+  options?: FacebookCredentialOptions
+) {
   const normalizedAudienceId = audienceId.trim();
 
   if (!normalizedAudienceId) {
     throw new FacebookApiError("Audience ID không hợp lệ.", 400);
   }
 
-  const response = await facebookRequest<MetaDeleteResponse>(normalizedAudienceId, {
-    method: "DELETE",
-  });
+  const credentials = await resolveCredentials(options);
+  const response = await facebookRequest<MetaDeleteResponse>(
+    normalizedAudienceId,
+    {
+      method: "DELETE",
+    },
+    credentials
+  );
 
   return {
     audienceId: normalizedAudienceId,
@@ -292,54 +404,167 @@ export async function deleteAudience(audienceId: string) {
   };
 }
 
-function getFacebookConfig(): FacebookConfig {
-  const accessToken = pickFirstDefinedEnv([
+function getApiVersion(): string {
+  return (
+    pickFirstDefinedEnv(["FACEBOOK_API_VERSION", "META_API_VERSION"]) ??
+    DEFAULT_FACEBOOK_API_VERSION
+  );
+}
+
+// True when a fallback token exists in .env (lets the UI offer it as an option).
+export function hasEnvAccessToken(): boolean {
+  return Boolean(
+    pickFirstDefinedEnv([
+      "FACEBOOK_ACCESS_TOKEN",
+      "FB_ACCESS_TOKEN",
+      "ACCESS_TOKEN",
+    ])
+  );
+}
+
+// Resolves the access token + app secret to use: a raw pair (validation) wins,
+// then a stored token by id (decrypted from Redis), then the .env fallback
+// token (which has no app secret). Throws when no token is available.
+async function resolveTokenAndSecret(
+  options?: FacebookCredentialOptions
+): Promise<{ accessToken: string; appSecret: string | null }> {
+  const rawToken = options?.token?.trim();
+  if (rawToken) {
+    return { accessToken: rawToken, appSecret: options?.appSecret?.trim() || null };
+  }
+
+  const tokenId = options?.tokenId?.trim();
+  if (tokenId) {
+    const credentials = await getFbTokenCredentials(tokenId);
+    if (!credentials) {
+      throw new FacebookApiError(
+        "Access token đã chọn không còn tồn tại. Hãy chọn hoặc thêm token khác.",
+        400
+      );
+    }
+    return {
+      accessToken: credentials.accessToken,
+      appSecret: credentials.appSecret,
+    };
+  }
+
+  const envToken = pickFirstDefinedEnv([
     "FACEBOOK_ACCESS_TOKEN",
     "FB_ACCESS_TOKEN",
     "ACCESS_TOKEN",
   ]);
-  const adAccountId = pickFirstDefinedEnv([
+  if (!envToken) {
+    throw new FacebookApiError(
+      "Chưa có access token. Hãy thêm token trong dashboard hoặc đặt FACEBOOK_ACCESS_TOKEN trong .env.",
+      400
+    );
+  }
+  return { accessToken: envToken, appSecret: null };
+}
+
+async function resolveCredentials(
+  options?: FacebookCredentialOptions
+): Promise<FacebookCredentials> {
+  const { accessToken, appSecret } = await resolveTokenAndSecret(options);
+  return {
+    accessToken,
+    appSecret,
+    apiVersion: getApiVersion(),
+  };
+}
+
+// Meta's appsecret_proof: HMAC-SHA256 of the access token keyed by the app
+// secret. Required when the app enables "Require app secret"; harmless (and
+// accepted) otherwise. Returns null when no app secret is configured.
+function computeAppSecretProof(
+  accessToken: string,
+  appSecret: string | null
+): string | null {
+  if (!appSecret) {
+    return null;
+  }
+  return createHmac("sha256", appSecret).update(accessToken).digest("hex");
+}
+
+// The ad account from .env, normalized to `act_<id>`. Now only a default —
+// callers may override it with a runtime-selected account. Returns null when
+// unset (the UI then drives selection from listAdAccounts()).
+export function getDefaultAdAccountId(): string | null {
+  const raw = pickFirstDefinedEnv([
     "FACEBOOK_AD_ACCOUNT_ID",
     "FB_AD_ACCOUNT_ID",
     "AD_ACCOUNT_ID",
   ]);
-  const apiVersion =
-    pickFirstDefinedEnv(["FACEBOOK_API_VERSION", "META_API_VERSION"]) ??
-    DEFAULT_FACEBOOK_API_VERSION;
 
-  if (!accessToken) {
+  if (!raw) {
+    return null;
+  }
+
+  return normalizeAdAccountId(raw);
+}
+
+// Resolves the ad account to act on: an explicit (user-selected) id wins,
+// otherwise fall back to the .env default. Throws when neither is available.
+function resolveAdAccountId(explicit?: string): string {
+  const normalizedExplicit = explicit?.trim();
+
+  if (normalizedExplicit) {
+    return normalizeAdAccountId(normalizedExplicit);
+  }
+
+  const fallback = getDefaultAdAccountId();
+
+  if (!fallback) {
     throw new FacebookApiError(
-      "Thiếu biến môi trường FACEBOOK_ACCESS_TOKEN trong .env.local.",
-      500
+      "Chưa chọn ad account. Hãy chọn một tài khoản quảng cáo từ danh sách hoặc đặt FACEBOOK_AD_ACCOUNT_ID trong .env.",
+      400
     );
   }
 
-  if (!adAccountId) {
-    throw new FacebookApiError(
-      "Thiếu biến môi trường FACEBOOK_AD_ACCOUNT_ID trong .env.local.",
-      500
-    );
+  return fallback;
+}
+
+function normalizeAdAccountId(rawAdAccountId: string): string {
+  const trimmed = rawAdAccountId.trim();
+  return trimmed.startsWith("act_") ? trimmed : `act_${trimmed}`;
+}
+
+function mapAdAccount(account: MetaAdAccount): AdAccountListItem | null {
+  const accountId = (
+    account.account_id ??
+    account.id?.replace(/^act_/, "") ??
+    ""
+  ).trim();
+
+  if (!accountId) {
+    return null;
   }
 
   return {
-    accessToken,
-    adAccountId: adAccountId.startsWith("act_")
-      ? adAccountId
-      : `act_${adAccountId}`,
-    apiVersion,
+    id: `act_${accountId}`,
+    accountId,
+    name: account.name?.trim() || `act_${accountId}`,
+    accountStatus: toNullableNumber(account.account_status),
+    currency: account.currency ?? null,
   };
 }
 
 async function facebookRequest<T>(
   path: string,
-  init: RequestInit & { query?: Record<string, string> }
+  init: RequestInit & { query?: Record<string, string> },
+  credentials: FacebookCredentials
 ): Promise<T> {
-  const { accessToken, apiVersion } = getFacebookConfig();
+  const { accessToken, apiVersion, appSecret } = credentials;
   const url = new URL(
     `${FACEBOOK_GRAPH_BASE_URL}/${apiVersion}/${path.replace(/^\/+/, "")}`
   );
 
   url.searchParams.set("access_token", accessToken);
+
+  const proof = computeAppSecretProof(accessToken, appSecret);
+  if (proof) {
+    url.searchParams.set("appsecret_proof", proof);
+  }
 
   for (const [key, value] of Object.entries(init.query ?? {})) {
     url.searchParams.set(key, value);
@@ -446,7 +671,8 @@ function extractTokenExpirationDetail(message?: string) {
 
 async function uploadAudienceUsers(
   audienceId: string,
-  hashedEmails: string[]
+  hashedEmails: string[],
+  credentials: FacebookCredentials
 ): Promise<MetaAudienceUploadResponse> {
   const matrixPayload = {
     schema: ["EMAIL_SHA256"],
@@ -454,16 +680,20 @@ async function uploadAudienceUsers(
   };
 
   try {
-    return await postUsersPayload(audienceId, matrixPayload);
+    return await postUsersPayload(audienceId, matrixPayload, credentials);
   } catch (error) {
     if (
       error instanceof FacebookApiError &&
       /schema|payload|data/i.test(error.message)
     ) {
-      return postUsersPayload(audienceId, {
-        schema: "EMAIL_SHA256",
-        data: hashedEmails,
-      });
+      return postUsersPayload(
+        audienceId,
+        {
+          schema: "EMAIL_SHA256",
+          data: hashedEmails,
+        },
+        credentials
+      );
     }
 
     throw error;
@@ -480,15 +710,20 @@ async function postUsersPayload(
     | {
         schema: string;
         data: string[];
-      }
+      },
+  credentials: FacebookCredentials
 ): Promise<MetaAudienceUploadResponse> {
   const uploadFormData = new URLSearchParams();
   uploadFormData.set("payload", JSON.stringify(payload));
 
-  return facebookRequest<MetaAudienceUploadResponse>(`${audienceId}/users`, {
-    method: "POST",
-    body: uploadFormData,
-  });
+  return facebookRequest<MetaAudienceUploadResponse>(
+    `${audienceId}/users`,
+    {
+      method: "POST",
+      body: uploadFormData,
+    },
+    credentials
+  );
 }
 
 function mapAudience(audience: MetaAudience): AudienceListItem {

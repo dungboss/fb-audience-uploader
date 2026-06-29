@@ -1,11 +1,12 @@
 "use client";
 
-import { startTransition, useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
+import { startTransition, useDeferredValue, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   AlertCircle,
   Download,
   FolderOpen,
+  KeyRound,
   Loader2,
   Plus,
   RefreshCcw,
@@ -55,6 +56,11 @@ const numberFormatter = new Intl.NumberFormat("vi-VN");
 // How often to refresh the job list while any job is queued/processing.
 const JOB_POLL_INTERVAL_MS = 2000;
 
+// Remembers the picked ad account across reloads (per browser).
+const AD_ACCOUNT_STORAGE_KEY = "fb-audience-uploader:selected-ad-account";
+// Remembers the picked access token id ("" = the .env fallback token).
+const TOKEN_STORAGE_KEY = "fb-audience-uploader:selected-token";
+
 type AudienceAvailability = "ready" | "populating";
 type AudienceJobKind = "create" | "append";
 type AudienceJobStatus =
@@ -75,6 +81,37 @@ type Audience = {
   sizeLowerBound: number | null;
   timeUpdated: string | null;
 };
+
+type AdAccount = {
+  id: string; // act_<id>
+  accountId: string;
+  name: string;
+  accountStatus: number | null;
+  currency: string | null;
+};
+
+type AdAccountListResponse = {
+  adAccounts?: AdAccount[];
+  defaultAdAccountId?: string | null;
+  error?: string;
+};
+
+type FbToken = {
+  id: string;
+  label: string;
+  appId: string | null;
+  createdAt: string;
+  lastValidatedAt: string | null;
+};
+
+type TokenListResponse = {
+  tokens?: FbToken[];
+  hasEnvToken?: boolean;
+  error?: string;
+};
+
+// One option in the token picker. The empty-id entry represents the .env token.
+type TokenOption = { id: string; label: string };
 
 type NasFileSelection = {
   fileName: string;
@@ -134,6 +171,33 @@ export default function Home() {
   const [createProgress, setCreateProgress] = useState<ProgressState | null>(null);
   const [isCreateSubmitting, setIsCreateSubmitting] = useState(false);
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
+
+  const [tokens, setTokens] = useState<FbToken[]>([]);
+  const [hasEnvToken, setHasEnvToken] = useState(false);
+  const [selectedTokenId, setSelectedTokenId] = useState("");
+  const [tokensReady, setTokensReady] = useState(false);
+  const [isLoadingTokens, setIsLoadingTokens] = useState(true);
+  const [isAddTokenDialogOpen, setIsAddTokenDialogOpen] = useState(false);
+  const [newTokenLabel, setNewTokenLabel] = useState("");
+  const [newTokenValue, setNewTokenValue] = useState("");
+  const [newTokenAppId, setNewTokenAppId] = useState("");
+  const [newTokenAppSecret, setNewTokenAppSecret] = useState("");
+  const [isAddingToken, setIsAddingToken] = useState(false);
+  const [deletingTokenId, setDeletingTokenId] = useState<string | null>(null);
+
+  const [adAccounts, setAdAccounts] = useState<AdAccount[]>([]);
+  const [selectedAdAccountId, setSelectedAdAccountId] = useState("");
+  const [isLoadingAdAccounts, setIsLoadingAdAccounts] = useState(true);
+
+  // Token picker options: the .env fallback (empty id) plus every stored token.
+  const tokenOptions: TokenOption[] = [
+    ...(hasEnvToken ? [{ id: "", label: "Token mặc định (.env)" }] : []),
+    ...tokens.map((token) => ({
+      id: token.id,
+      label: token.appId ? `${token.label} · App ${token.appId}` : token.label,
+    })),
+  ];
+  const hasAnyTokenOption = tokenOptions.length > 0;
 
   const [audiences, setAudiences] = useState<Audience[]>([]);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
@@ -217,15 +281,160 @@ export default function Home() {
     }
   }
 
-  // --- Bootstrap: load audiences ---
+  // --- Bootstrap step 1: load access tokens, pick the active one ---
   useEffect(() => {
+    let isCancelled = false;
+
+    void (async () => {
+      setIsLoadingTokens(true);
+
+      try {
+        const { tokens: nextTokens, hasEnvToken: envToken } =
+          await fetchTokensFromApi();
+
+        if (isCancelled) {
+          return;
+        }
+
+        setTokens(nextTokens);
+        setHasEnvToken(envToken);
+
+        const optionIds = [
+          ...(envToken ? [""] : []),
+          ...nextTokens.map((token) => token.id),
+        ];
+        const stored =
+          typeof window !== "undefined"
+            ? window.localStorage.getItem(TOKEN_STORAGE_KEY)
+            : null;
+        const pick =
+          stored !== null && optionIds.includes(stored)
+            ? stored
+            : envToken
+              ? ""
+              : nextTokens[0]?.id ?? "";
+
+        setSelectedTokenId(pick);
+        setTokensReady(true);
+
+        if (optionIds.length === 0) {
+          // No token at all — guide the user to add one.
+          setIsBootstrapping(false);
+          setServerError(
+            "Chưa có access token nào. Hãy bấm “Thêm token” để kết nối Meta."
+          );
+        }
+      } catch (error) {
+        if (isCancelled) {
+          return;
+        }
+
+        const message = getErrorMessage(
+          error,
+          "Không thể tải danh sách access token."
+        );
+        setServerError(message);
+        setIsBootstrapping(false);
+        toast.error("Không tải được token.", { description: message });
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingTokens(false);
+        }
+      }
+    })();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  // --- Bootstrap step 2: load ad accounts for the active token ---
+  // Depends on tokensReady too so it runs even when the picked token id is ""
+  // (the .env fallback), which wouldn't change selectedTokenId from its initial.
+  useEffect(() => {
+    if (!tokensReady || !hasAnyTokenOption) {
+      return;
+    }
+
+    let isCancelled = false;
+
+    void (async () => {
+      setIsLoadingAdAccounts(true);
+
+      try {
+        const { adAccounts: accounts, defaultAdAccountId } =
+          await fetchAdAccountsFromApi(selectedTokenId);
+
+        if (isCancelled) {
+          return;
+        }
+
+        setAdAccounts(accounts);
+
+        const stored =
+          typeof window !== "undefined"
+            ? window.localStorage.getItem(AD_ACCOUNT_STORAGE_KEY)
+            : null;
+        const pick =
+          (stored && accounts.some((a) => a.id === stored) ? stored : null) ??
+          (defaultAdAccountId &&
+          accounts.some((a) => a.id === defaultAdAccountId)
+            ? defaultAdAccountId
+            : null) ??
+          accounts[0]?.id ??
+          "";
+
+        setSelectedAdAccountId(pick);
+
+        if (!pick) {
+          setIsBootstrapping(false);
+          setServerError(
+            "Token này không truy cập được ad account nào. Kiểm tra quyền ads_management / ads_read."
+          );
+        } else {
+          setServerError(null);
+        }
+      } catch (error) {
+        if (isCancelled) {
+          return;
+        }
+
+        const message = getErrorMessage(
+          error,
+          "Không thể tải danh sách ad account từ Meta."
+        );
+        setServerError(message);
+        setIsBootstrapping(false);
+        toast.error("Không tải được ad account.", { description: message });
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingAdAccounts(false);
+        }
+      }
+    })();
+
+    return () => {
+      isCancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTokenId, tokensReady]);
+
+  // --- Bootstrap step 3: load audiences for the active token + ad account ---
+  useEffect(() => {
+    if (!selectedAdAccountId) {
+      return;
+    }
+
     let isCancelled = false;
 
     void (async () => {
       setIsBootstrapping(true);
 
       try {
-        const nextAudiences = await fetchAudiencesFromApi();
+        const nextAudiences = await fetchAudiencesFromApi(
+          selectedAdAccountId,
+          selectedTokenId
+        );
 
         if (isCancelled) {
           return;
@@ -256,7 +465,125 @@ export default function Home() {
     return () => {
       isCancelled = true;
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAdAccountId, selectedTokenId]);
+
+  function handleSelectToken(tokenId: string) {
+    if (tokenId === selectedTokenId) {
+      return;
+    }
+
+    setSelectedTokenId(tokenId);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, tokenId);
+    }
+  }
+
+  async function handleAddToken() {
+    const token = newTokenValue.trim();
+
+    if (!token) {
+      toast.error("Hãy dán access token.");
+      return;
+    }
+
+    setIsAddingToken(true);
+
+    try {
+      const response = await fetch("/api/facebook/tokens", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          label: newTokenLabel.trim(),
+          token,
+          appId: newTokenAppId.trim(),
+          appSecret: newTokenAppSecret.trim(),
+        }),
+      });
+      const payload = await readJsonSafe<{
+        token?: FbToken;
+        adAccountCount?: number;
+        error?: string;
+      }>(response);
+
+      if (!response.ok || !payload.token) {
+        throw new Error(payload.error || "Không thể thêm access token.");
+      }
+
+      const { tokens: nextTokens, hasEnvToken: envToken } =
+        await fetchTokensFromApi();
+      setTokens(nextTokens);
+      setHasEnvToken(envToken);
+      handleSelectToken(payload.token.id);
+
+      toast.success("Đã thêm access token.", {
+        description: `${payload.token.label} · ${formatNumber(
+          payload.adAccountCount ?? 0
+        )} ad account khả dụng.`,
+      });
+
+      setNewTokenLabel("");
+      setNewTokenValue("");
+      setNewTokenAppId("");
+      setNewTokenAppSecret("");
+      setIsAddTokenDialogOpen(false);
+    } catch (error) {
+      toast.error("Thêm token thất bại.", {
+        description: getErrorMessage(error, "Không thể thêm access token."),
+      });
+    } finally {
+      setIsAddingToken(false);
+    }
+  }
+
+  async function handleDeleteToken(tokenId: string) {
+    if (!tokenId) {
+      return;
+    }
+
+    setDeletingTokenId(tokenId);
+
+    try {
+      const response = await fetch(`/api/facebook/tokens/${tokenId}`, {
+        method: "DELETE",
+      });
+      const payload = await readJsonSafe<{ deleted?: boolean; error?: string }>(
+        response
+      );
+
+      if (!response.ok || !payload.deleted) {
+        throw new Error(payload.error || "Không thể xóa access token.");
+      }
+
+      const { tokens: nextTokens, hasEnvToken: envToken } =
+        await fetchTokensFromApi();
+      setTokens(nextTokens);
+      setHasEnvToken(envToken);
+
+      if (selectedTokenId === tokenId) {
+        handleSelectToken(envToken ? "" : nextTokens[0]?.id ?? "");
+      }
+
+      toast.success("Đã xóa access token.");
+    } catch (error) {
+      toast.error("Xóa token thất bại.", {
+        description: getErrorMessage(error, "Không thể xóa access token."),
+      });
+    } finally {
+      setDeletingTokenId(null);
+    }
+  }
+
+  function handleSelectAdAccount(adAccountId: string) {
+    if (!adAccountId || adAccountId === selectedAdAccountId) {
+      return;
+    }
+
+    setSelectedAdAccountId(adAccountId);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(AD_ACCOUNT_STORAGE_KEY, adAccountId);
+    }
+  }
 
   // --- Mount: load recent jobs once ---
   useEffect(() => {
@@ -435,6 +762,11 @@ export default function Home() {
       return;
     }
 
+    if (!selectedAdAccountId) {
+      toast.error("Hãy chọn tài khoản quảng cáo trước khi tạo audience.");
+      return;
+    }
+
     const fileName = createFile.fileName;
     setIsCreateSubmitting(true);
 
@@ -566,9 +898,15 @@ export default function Home() {
 
     const results = await Promise.allSettled(
       deleteTargets.map(async (audience) => {
-        const response = await fetch(`/api/audiences/${audience.id}`, {
-          method: "DELETE",
-        });
+        const deleteQuery = selectedTokenId
+          ? `?tokenId=${encodeURIComponent(selectedTokenId)}`
+          : "";
+        const response = await fetch(
+          `/api/audiences/${audience.id}${deleteQuery}`,
+          {
+            method: "DELETE",
+          }
+        );
         const payload = await readJsonSafe<DeleteAudienceResponse>(response);
 
         if (!response.ok || !payload.deleted) {
@@ -699,8 +1037,39 @@ export default function Home() {
     }
   }
 
-  async function fetchAudiencesFromApi() {
-    const response = await fetch("/api/audiences", { cache: "no-store" });
+  async function fetchTokensFromApi() {
+    const response = await fetch("/api/facebook/tokens", { cache: "no-store" });
+    const payload = await readJsonSafe<TokenListResponse>(response);
+    if (!response.ok) throw new Error(payload.error || "API error");
+    return {
+      tokens: payload.tokens ?? [],
+      hasEnvToken: Boolean(payload.hasEnvToken),
+    };
+  }
+
+  async function fetchAdAccountsFromApi(tokenId: string = selectedTokenId) {
+    const query = tokenId ? `?tokenId=${encodeURIComponent(tokenId)}` : "";
+    const response = await fetch(`/api/facebook/ad-accounts${query}`, {
+      cache: "no-store",
+    });
+    const payload = await readJsonSafe<AdAccountListResponse>(response);
+    if (!response.ok) throw new Error(payload.error || "API error");
+    return {
+      adAccounts: payload.adAccounts ?? [],
+      defaultAdAccountId: payload.defaultAdAccountId ?? null,
+    };
+  }
+
+  async function fetchAudiencesFromApi(
+    accountId: string = selectedAdAccountId,
+    tokenId: string = selectedTokenId
+  ) {
+    if (!accountId) return [];
+    const params = new URLSearchParams({ adAccountId: accountId });
+    if (tokenId) params.set("tokenId", tokenId);
+    const response = await fetch(`/api/audiences?${params.toString()}`, {
+      cache: "no-store",
+    });
     const payload = await readJsonSafe<AudienceListResponse>(response);
     if (!response.ok) throw new Error(payload.error || "API error");
     return payload.audiences ?? [];
@@ -725,7 +1094,14 @@ export default function Home() {
     const response = await fetch("/api/upload-jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
+      // Snapshot the picked ad account + token onto the job so the worker
+      // creates the audience under the right account using the right token
+      // (append jobs ignore the ad account harmlessly).
+      body: JSON.stringify({
+        ...input,
+        adAccountId: selectedAdAccountId,
+        tokenId: selectedTokenId,
+      }),
     });
     const payload = await readJsonSafe<AudienceJobResponse>(response);
     if (!response.ok || !payload.job) throw new Error(payload.error || "Không thể tạo job.");
@@ -817,6 +1193,105 @@ export default function Home() {
             <p className="mt-2 text-muted-foreground">
               Đồng bộ Custom Audience từ file trên NAS lên Meta Ads.
             </p>
+          </div>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+            <div className="flex flex-col gap-1.5">
+              <label
+                htmlFor="token-select"
+                className="text-xs font-medium text-muted-foreground"
+              >
+                Access token
+              </label>
+              <div className="flex items-center gap-2">
+                <div className="relative">
+                  <select
+                    id="token-select"
+                    value={selectedTokenId}
+                    onChange={(event) => handleSelectToken(event.target.value)}
+                    disabled={isLoadingTokens || !hasAnyTokenOption}
+                    className="h-10 w-full min-w-56 appearance-none rounded-xl border border-input bg-white px-3 pr-9 text-sm font-medium shadow-sm outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
+                  >
+                    {isLoadingTokens ? (
+                      <option value="">Đang tải token...</option>
+                    ) : !hasAnyTokenOption ? (
+                      <option value="">Chưa có token</option>
+                    ) : (
+                      tokenOptions.map((option) => (
+                        <option key={option.id || "__env__"} value={option.id}>
+                          {option.label}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  {isLoadingTokens ? (
+                    <Loader2 className="pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2 animate-spin text-muted-foreground" />
+                  ) : (
+                    <KeyRound className="pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2 text-muted-foreground" />
+                  )}
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  title="Thêm access token"
+                  onClick={() => setIsAddTokenDialogOpen(true)}
+                >
+                  <Plus className="size-4" />
+                </Button>
+                {selectedTokenId ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    title="Xóa token đang chọn"
+                    onClick={() => handleDeleteToken(selectedTokenId)}
+                    disabled={deletingTokenId === selectedTokenId}
+                  >
+                    {deletingTokenId === selectedTokenId ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="size-4" />
+                    )}
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <label
+                htmlFor="ad-account-select"
+                className="text-xs font-medium text-muted-foreground"
+              >
+                Tài khoản quảng cáo
+              </label>
+              <div className="relative">
+                <select
+                  id="ad-account-select"
+                  value={selectedAdAccountId}
+                  onChange={(event) => handleSelectAdAccount(event.target.value)}
+                  disabled={isLoadingAdAccounts || adAccounts.length === 0}
+                  className="h-10 w-full min-w-72 appearance-none rounded-xl border border-input bg-white px-3 pr-9 text-sm font-medium shadow-sm outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
+                >
+                  {isLoadingAdAccounts ? (
+                    <option value="">Đang tải tài khoản...</option>
+                  ) : adAccounts.length === 0 ? (
+                    <option value="">Không có tài khoản khả dụng</option>
+                  ) : (
+                    adAccounts.map((account) => (
+                      <option key={account.id} value={account.id}>
+                        {account.name} ({account.id})
+                        {account.currency ? ` · ${account.currency}` : ""}
+                      </option>
+                    ))
+                  )}
+                </select>
+                {isLoadingAdAccounts ? (
+                  <Loader2 className="pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2 animate-spin text-muted-foreground" />
+                ) : (
+                  <Users className="pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2 text-muted-foreground" />
+                )}
+              </div>
+            </div>
           </div>
         </header>
 
@@ -1307,6 +1782,126 @@ export default function Home() {
                   <>
                     <Upload className="size-4" />
                     Đưa vào hàng đợi
+                  </>
+                )}
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={isAddTokenDialogOpen}
+        onOpenChange={(open) => {
+          if (isAddingToken) {
+            return;
+          }
+          setIsAddTokenDialogOpen(open);
+          if (!open) {
+            setNewTokenLabel("");
+            setNewTokenValue("");
+            setNewTokenAppId("");
+            setNewTokenAppSecret("");
+          }
+        }}
+        disablePointerDismissal={isAddingToken}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <KeyRound className="size-5" />
+              Thêm Facebook access token
+            </DialogTitle>
+            <DialogDescription>
+              Token (kèm App ID / App Secret) được kiểm tra với Meta rồi mã hóa
+              lưu trên server, không lưu trong trình duyệt. Cần quyền
+              ads_management hoặc ads_read.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="mt-5 space-y-5">
+            <div className="space-y-3">
+              <label className="text-sm font-medium">Nhãn (tùy chọn)</label>
+              <Input
+                value={newTokenLabel}
+                onChange={(e) => setNewTokenLabel(e.target.value)}
+                placeholder="VD: BM Công ty A"
+                disabled={isAddingToken}
+              />
+            </div>
+            <div className="space-y-3">
+              <label className="text-sm font-medium">Access token</label>
+              <Textarea
+                value={newTokenValue}
+                onChange={(e) => setNewTokenValue(e.target.value)}
+                placeholder="Dán access token vào đây..."
+                disabled={isAddingToken}
+                rows={4}
+                className="font-mono text-xs"
+              />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-3">
+                <label className="text-sm font-medium">App ID (tùy chọn)</label>
+                <Input
+                  value={newTokenAppId}
+                  onChange={(e) => setNewTokenAppId(e.target.value)}
+                  placeholder="VD: 1234567890"
+                  disabled={isAddingToken}
+                  className="font-mono text-xs"
+                />
+              </div>
+              <div className="space-y-3">
+                <label className="text-sm font-medium">
+                  App Secret (tùy chọn)
+                </label>
+                <Input
+                  type="password"
+                  value={newTokenAppSecret}
+                  onChange={(e) => setNewTokenAppSecret(e.target.value)}
+                  placeholder="Để bật appsecret_proof"
+                  disabled={isAddingToken}
+                  className="font-mono text-xs"
+                  autoComplete="off"
+                />
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              App Secret dùng để tạo appsecret_proof — bắt buộc nếu app bật
+              “Require app secret”. Bỏ trống nếu app không yêu cầu.
+            </p>
+          </div>
+
+          <DialogFooter>
+            <div className="flex items-center gap-3">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  setIsAddTokenDialogOpen(false);
+                  setNewTokenLabel("");
+                  setNewTokenValue("");
+                  setNewTokenAppId("");
+                  setNewTokenAppSecret("");
+                }}
+                disabled={isAddingToken}
+              >
+                Đóng
+              </Button>
+              <Button
+                type="button"
+                onClick={handleAddToken}
+                disabled={!newTokenValue.trim() || isAddingToken}
+              >
+                {isAddingToken ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Đang kiểm tra...
+                  </>
+                ) : (
+                  <>
+                    <Plus className="size-4" />
+                    Thêm token
                   </>
                 )}
               </Button>

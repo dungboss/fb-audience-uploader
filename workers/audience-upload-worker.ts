@@ -87,6 +87,10 @@ async function main() {
             createEmptyAudience({
               name: uploadJob.name,
               description: uploadJob.description,
+              // Snapshotted at job creation; falls back to the .env defaults
+              // inside createEmptyAudience when null (older jobs / unset).
+              adAccountId: uploadJob.adAccountId ?? undefined,
+              tokenId: uploadJob.tokenId ?? undefined,
             })
           );
 
@@ -117,6 +121,7 @@ async function main() {
           uploadJob.nasFilePath,
           totalBytes,
           resume,
+          uploadJob.tokenId ?? undefined,
           async (progress) => {
             // Cooperative cancel: stop streaming/uploading if the job was cancelled.
             if (await isJobCancelled(jobId)) {
@@ -281,6 +286,7 @@ async function syncLinesFromNas(
   nasFilePath: string,
   totalBytes: number,
   resume: { syncedLines: number; syncedHashCount: number },
+  tokenId: string | undefined,
   onProgress: (progress: SyncProgress) => Promise<void>
 ) {
   // metaBatchSize is configurable via UPLOAD_META_BATCH_SIZE (Meta documents 10,000/call).
@@ -320,7 +326,7 @@ async function syncLinesFromNas(
       await acquireMetaRequestSlot(metaRequestIntervalMs);
 
       const result = await retryMetaAware(() =>
-        uploadHashedUsers(audienceId, batch)
+        uploadHashedUsers(audienceId, batch, { tokenId })
       );
       syncedHashCount += result.num_received ?? batch.length;
       syncedLines += batch.length;
@@ -341,7 +347,7 @@ async function syncLinesFromNas(
     await acquireMetaRequestSlot(metaRequestIntervalMs);
 
     const result = await retryMetaAware(() =>
-      uploadHashedUsers(audienceId, accumulator)
+      uploadHashedUsers(audienceId, accumulator, { tokenId })
     );
     syncedHashCount += result.num_received ?? accumulator.length;
     syncedLines += accumulator.length;

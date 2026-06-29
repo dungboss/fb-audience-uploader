@@ -17,12 +17,14 @@ export async function POST(
   try {
     const body = (await request.json()) as {
       hashedEmails?: unknown;
+      tokenId?: unknown;
     };
     const { id } = await params;
 
     const result = await addUsersToAudience({
       audienceId: id,
       hashedEmails: body.hashedEmails,
+      tokenId: typeof body.tokenId === "string" ? body.tokenId : undefined,
     });
 
     return NextResponse.json(result);
@@ -45,12 +47,14 @@ export async function POST(
 }
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params;
-    const result = await deleteAudience(id);
+    const tokenId =
+      new URL(request.url).searchParams.get("tokenId") ?? undefined;
+    const result = await deleteAudience(id, { tokenId });
 
     return NextResponse.json(result);
   } catch (error) {

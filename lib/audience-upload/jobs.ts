@@ -21,6 +21,8 @@ export async function createAudienceUploadJob(input: {
   name?: string;
   description?: string;
   audienceId?: string;
+  adAccountId?: string;
+  tokenId?: string;
   fileSize?: number | null;
 }) {
   const kind = input.kind;
@@ -28,6 +30,8 @@ export async function createAudienceUploadJob(input: {
   const name = input.name?.trim() ?? "";
   const description = input.description?.trim() ?? "";
   const audienceId = input.audienceId?.trim() ?? "";
+  const adAccountId = input.adAccountId?.trim() ?? "";
+  const tokenId = input.tokenId?.trim() ?? "";
 
   if (!nasFilePath) {
     throw new FacebookApiError("Đường dẫn file trên NAS không hợp lệ.", 400);
@@ -54,6 +58,8 @@ export async function createAudienceUploadJob(input: {
     nasFilePath,
     fileName,
     fileSize: typeof input.fileSize === "number" && input.fileSize > 0 ? input.fileSize : null,
+    adAccountId: adAccountId || null,
+    tokenId: tokenId || null,
     audienceId: kind === "append" ? audienceId : null,
     syncedHashCount: 0,
     syncedLines: 0,
@@ -191,6 +197,8 @@ function parseJobPayload(jobId: string, payload: Record<string, string>) {
     nasFilePath: payload.nasFilePath ?? "",
     fileName: payload.fileName ?? "",
     fileSize: parseNullableInteger(payload.fileSize),
+    adAccountId: payload.adAccountId || null,
+    tokenId: payload.tokenId || null,
     audienceId: payload.audienceId || null,
     syncedHashCount: parseInteger(payload.syncedHashCount),
     syncedLines: parseInteger(payload.syncedLines),

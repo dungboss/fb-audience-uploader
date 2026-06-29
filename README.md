@@ -35,6 +35,36 @@ The easiest way to deploy your Next.js app is to use the [Vercel Platform](https
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
 
+## Access tokens
+
+Tokens are managed from the dashboard, not hardcoded in `.env`. Use **Thêm
+token** in the header to paste a token (with an optional label, and optional
+**App ID + App Secret**); it is validated against Meta (`me/adaccounts`) then
+stored **encrypted at rest** in Redis (AES-256-GCM). Set `TOKEN_ENCRYPTION_KEY`
+in `.env` first — generate one with `openssl rand -base64 32`. Tokens need
+`ads_management` or `ads_read` scope.
+
+- **App ID / App Secret are per token** (no longer read from `.env`). When an
+  app secret is provided, every Graph call made with that token carries an
+  `appsecret_proof` — required if the app enables "Require app secret", harmless
+  otherwise. Leave both blank for apps that don't require it. The app secret is
+  encrypted alongside the token; the app id is stored as a plain reference.
+- Raw tokens and app secrets never round-trip back to the browser; only token
+  ids (and the non-secret app id) do.
+- The picker remembers the selected token per browser (localStorage stores the
+  id, never the secret).
+- `FACEBOOK_ACCESS_TOKEN` in `.env` still works as the optional default token.
+- Each upload job snapshots the chosen token id so the worker (a separate
+  process) resolves the same token from Redis.
+
+## Ad account selection
+
+The dashboard fetches every ad account the **active token** can reach (Graph
+`me/adaccounts`) and shows them in a picker in the header — no need to hardcode
+the target account. The picked account is remembered per browser and is
+snapshotted onto each upload job so the worker creates the audience under the
+right account. `FACEBOOK_AD_ACCOUNT_ID` is now only an optional default.
+
 ## NAS WebDAV
 
 The dashboard can browse files from a NAS WebDAV endpoint and load them into the upload flow.
