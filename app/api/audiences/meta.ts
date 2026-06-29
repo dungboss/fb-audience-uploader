@@ -152,6 +152,13 @@ export function isFacebookRateLimitError(error: unknown) {
   );
 }
 
+// Meta error #2650 "service error" on the custom-audience /users endpoint. Not a
+// documented rate limit, but per our chosen policy we back off (wait) and resume
+// the upload from where it stopped instead of failing the whole job.
+export function isMetaServiceError(error: unknown) {
+  return error instanceof FacebookApiError && error.details?.code === 2650;
+}
+
 export function validateHashedEmails(input: unknown): string[] {
   if (!Array.isArray(input) || input.length === 0) {
     throw new FacebookApiError(

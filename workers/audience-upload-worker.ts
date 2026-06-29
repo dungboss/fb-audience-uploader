@@ -3,6 +3,7 @@ import { UnrecoverableError, Worker } from "bullmq";
 import {
   createEmptyAudience,
   isFacebookRateLimitError,
+  isMetaServiceError,
   uploadHashedUsers,
 } from "../app/api/audiences/meta";
 import { getAudienceUploadConfig } from "../lib/audience-upload/env";
@@ -377,7 +378,14 @@ async function retryMetaAware<T>(callback: () => Promise<T>) {
   } catch (error) {
     if (isFacebookRateLimitError(error)) {
       throw new MetaRateLimitRetryError(
-        "Facebook rate limit reached. Worker se thu lai sau 1 gio."
+        "Facebook gioi han toc do. Worker se cho roi up tiep tu cho dang do."
+      );
+    }
+
+    // Per policy: Meta #2650 "service error" → wait, then resume the upload.
+    if (isMetaServiceError(error)) {
+      throw new MetaRateLimitRetryError(
+        "Meta tra ve loi #2650 (service error). Worker se cho roi up tiep tu cho dang do."
       );
     }
 
@@ -456,7 +464,8 @@ function buildRetryMessage(error: Error) {
     const retryAt = new Date(
       Date.now() + getAudienceUploadConfig().metaRateLimitDelayMs
     ).toLocaleString("vi-VN");
-    return `Facebook dang gioi han toc do. Worker se gui tiep sau ${retryAt}.`;
+    // error.message carries the specific reason (rate limit vs #2650).
+    return `${error.message} Du kien thu lai luc ${retryAt}.`;
   }
 
   if (isTransientFetchError(error)) {
