@@ -74,6 +74,7 @@ async function main() {
       const resume = {
         syncedLines: uploadJob.syncedLines,
         syncedHashCount: uploadJob.syncedHashCount,
+        syncedByteOffset: uploadJob.syncedByteOffset,
       };
       if (resume.syncedLines > 0) {
         console.info(
@@ -123,6 +124,7 @@ async function main() {
           totalBytes,
           resume,
           uploadJob.tokenId ?? undefined,
+          uploadJob.startOffsetBytes,
           async (progress) => {
             // Cooperative cancel: stop streaming/uploading if the job was cancelled.
             if (await isJobCancelled(jobId)) {
@@ -134,6 +136,7 @@ async function main() {
               processedBytes: progress.processedBytes,
               syncedHashCount: progress.syncedHashCount,
               syncedLines: progress.syncedLines,
+              syncedByteOffset: progress.syncedByteOffset,
               totalBytes: totalBytes > 0 ? totalBytes : null,
               lastSessionId: progress.lastSessionId,
               updatedAt: new Date().toISOString(),
@@ -154,6 +157,7 @@ async function main() {
           processedBytes: result.processedBytes,
           syncedHashCount: result.syncedHashCount,
           syncedLines: result.syncedLines,
+          syncedByteOffset: result.syncedByteOffset,
           totalLines: result.processedLines,
           totalBytes: totalBytes > 0 ? totalBytes : null,
           lastSessionId: result.lastSessionId,
@@ -279,6 +283,7 @@ interface SyncProgress {
   processedBytes: number;
   syncedHashCount: number;
   syncedLines: number;
+  syncedByteOffset: number;
   lastSessionId: string | null;
 }
 
@@ -286,8 +291,9 @@ async function syncLinesFromNas(
   audienceId: string,
   nasFilePath: string,
   totalBytes: number,
-  resume: { syncedLines: number; syncedHashCount: number },
+  resume: { syncedLines: number; syncedHashCount: number; syncedByteOffset: number },
   tokenId: string | undefined,
+  startOffsetBytes: number,
   onProgress: (progress: SyncProgress) => Promise<void>
 ) {
   // metaBatchSize is configurable via UPLOAD_META_BATCH_SIZE (Meta documents 10,000/call).
@@ -300,14 +306,32 @@ async function syncLinesFromNas(
   let processedBytes = 0;
   let syncedHashCount = resume.syncedHashCount;
   let syncedLines = resume.syncedLines;
+  // Absolute byte boundary confirmed-uploaded so far (conservative).
+  let syncedByteOffset = resume.syncedByteOffset;
   let lastSessionId: string | null = null;
 
   // Accumulate hashes across stream yields until we reach batch size
   const accumulator: string[] = [];
+  // One entry per chunk: the absolute byte boundary becomes "synced" only once
+  // every line up to `linesThreshold` has actually been uploaded. Keeps
+  // syncedByteOffset conservative — never ahead of what Meta received.
+  const offsetCheckpoints: Array<{ linesThreshold: number; offset: number }> = [];
 
-  for await (const { hashes, bytesRead } of streamNasFileLines(
+  const advanceSyncedByteOffset = () => {
+    while (
+      offsetCheckpoints.length > 0 &&
+      offsetCheckpoints[0].linesThreshold <= syncedLines
+    ) {
+      syncedByteOffset = offsetCheckpoints.shift()!.offset;
+    }
+  };
+
+  for await (const { hashes, bytesRead, endOffset } of streamNasFileLines(
     nasFilePath,
-    { knownSize: totalBytes > 0 ? totalBytes : null }
+    {
+      knownSize: totalBytes > 0 ? totalBytes : null,
+      startByte: startOffsetBytes > 0 ? startOffsetBytes : 0,
+    }
   )) {
     processedBytes += bytesRead;
 
@@ -319,6 +343,10 @@ async function syncLinesFromNas(
       }
       accumulator.push(hash);
     }
+
+    // This chunk's byte boundary is safe once `processedLines` are all uploaded.
+    offsetCheckpoints.push({ linesThreshold: processedLines, offset: endOffset });
+    advanceSyncedByteOffset();
 
     // Flush accumulator in batches
     while (accumulator.length >= metaBatchSize) {
@@ -332,12 +360,14 @@ async function syncLinesFromNas(
       syncedHashCount += result.num_received ?? batch.length;
       syncedLines += batch.length;
       lastSessionId = result.session_id ?? lastSessionId;
+      advanceSyncedByteOffset();
 
       await onProgress({
         processedLines,
         processedBytes,
         syncedHashCount,
         syncedLines,
+        syncedByteOffset,
         lastSessionId,
       });
     }
@@ -353,21 +383,27 @@ async function syncLinesFromNas(
     syncedHashCount += result.num_received ?? accumulator.length;
     syncedLines += accumulator.length;
     lastSessionId = result.session_id ?? lastSessionId;
-
-    await onProgress({
-      processedLines,
-      processedBytes,
-      syncedHashCount,
-      syncedLines,
-      lastSessionId,
-    });
   }
+
+  // Everything read has now been uploaded → drain remaining checkpoints so the
+  // offset reflects the end of the consumed data.
+  advanceSyncedByteOffset();
+
+  await onProgress({
+    processedLines,
+    processedBytes,
+    syncedHashCount,
+    syncedLines,
+    syncedByteOffset,
+    lastSessionId,
+  });
 
   return {
     processedLines,
     processedBytes,
     syncedHashCount,
     syncedLines,
+    syncedByteOffset,
     lastSessionId,
   };
 }

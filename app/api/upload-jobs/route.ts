@@ -44,8 +44,15 @@ export async function POST(request: Request) {
       audienceId?: unknown;
       adAccountId?: unknown;
       tokenId?: unknown;
+      startOffsetMb?: unknown;
       fileSize?: unknown;
     };
+
+    // User-entered start offset in MB → bytes (resume a new job from there).
+    const startOffsetBytes =
+      typeof body.startOffsetMb === "number" && body.startOffsetMb > 0
+        ? Math.floor(body.startOffsetMb * 1024 * 1024)
+        : undefined;
 
     const job = await createAudienceUploadJob({
       kind: body.kind === "append" ? "append" : "create",
@@ -59,6 +66,7 @@ export async function POST(request: Request) {
       adAccountId:
         typeof body.adAccountId === "string" ? body.adAccountId : undefined,
       tokenId: typeof body.tokenId === "string" ? body.tokenId : undefined,
+      startOffsetBytes,
       fileSize:
         typeof body.fileSize === "number" ? body.fileSize : undefined,
     });

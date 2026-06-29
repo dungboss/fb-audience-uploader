@@ -24,8 +24,15 @@ export interface AudienceUploadJob {
   // fall back to FACEBOOK_ACCESS_TOKEN in .env.
   tokenId: string | null;
   audienceId: string | null;
+  // Absolute byte offset in the NAS file to START uploading from (user-chosen,
+  // e.g. to resume a previously-interrupted upload). 0 = from the beginning.
+  startOffsetBytes: number;
   syncedHashCount: number;
   syncedLines: number;
+  // Absolute byte offset successfully uploaded so far (a clean line boundary).
+  // Shown to the user as MB so they can resume a new job from here after a
+  // failure. Always conservative — never ahead of what Meta actually received.
+  syncedByteOffset: number;
   processedLines: number;
   processedBytes: number;
   totalLines: number | null;

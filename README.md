@@ -65,6 +65,20 @@ the target account. The picked account is remembered per browser and is
 snapshotted onto each upload job so the worker creates the audience under the
 right account. `FACEBOOK_AD_ACCOUNT_ID` is now only an optional default.
 
+## Resuming a large upload from an offset
+
+Big files are uploaded in 10 MB ranges; the worker tracks how many bytes have
+been **confirmed-uploaded to Meta** and shows it per job ("Đã up: X MB"). The
+tracked offset is conservative — it never runs ahead of what Meta received.
+
+If a job fails (e.g. Meta `#2650` exhausts its retries), the failed row shows the
+uploaded offset and a suggested **start offset in MB**. To continue, create a new
+upload job for the **same file** and enter that MB value in **"Bắt đầu từ offset
+(MB)"** — the worker range-reads from there instead of re-uploading the whole
+file. The suggested value is rounded **down** on purpose: starting slightly early
+re-sends a few already-uploaded rows (Meta de-duplicates by hash), whereas
+starting too late would skip data. Requires a NAS that supports HTTP Range.
+
 ## NAS WebDAV
 
 The dashboard can browse files from a NAS WebDAV endpoint and load them into the upload flow.

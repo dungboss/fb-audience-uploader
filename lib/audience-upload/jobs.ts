@@ -23,6 +23,7 @@ export async function createAudienceUploadJob(input: {
   audienceId?: string;
   adAccountId?: string;
   tokenId?: string;
+  startOffsetBytes?: number;
   fileSize?: number | null;
 }) {
   const kind = input.kind;
@@ -32,6 +33,10 @@ export async function createAudienceUploadJob(input: {
   const audienceId = input.audienceId?.trim() ?? "";
   const adAccountId = input.adAccountId?.trim() ?? "";
   const tokenId = input.tokenId?.trim() ?? "";
+  const startOffsetBytes =
+    typeof input.startOffsetBytes === "number" && input.startOffsetBytes > 0
+      ? Math.floor(input.startOffsetBytes)
+      : 0;
 
   if (!nasFilePath) {
     throw new FacebookApiError("Đường dẫn file trên NAS không hợp lệ.", 400);
@@ -61,8 +66,10 @@ export async function createAudienceUploadJob(input: {
     adAccountId: adAccountId || null,
     tokenId: tokenId || null,
     audienceId: kind === "append" ? audienceId : null,
+    startOffsetBytes,
     syncedHashCount: 0,
     syncedLines: 0,
+    syncedByteOffset: startOffsetBytes,
     processedLines: 0,
     processedBytes: 0,
     totalLines: null,
@@ -109,6 +116,7 @@ export async function patchAudienceUploadJob(
       | "totalBytes"
       | "syncedHashCount"
       | "syncedLines"
+      | "syncedByteOffset"
       | "lastSessionId"
       | "errorMessage"
       | "updatedAt"
@@ -174,6 +182,53 @@ export async function cancelAudienceUploadJob(jobId: string) {
   return getAudienceUploadJob(normalizedJobId);
 }
 
+// Removes a job entirely: drop it from the recent-jobs index and delete its
+// hash. Used for "Xoá" on a terminal (failed/completed/cancelled) job.
+export async function deleteAudienceUploadJob(jobId: string) {
+  const normalizedJobId = jobId.trim();
+
+  if (!normalizedJobId) {
+    throw new FacebookApiError("Job ID không hợp lệ.", 400);
+  }
+
+  await getRedis().lrem(RECENT_JOBS_KEY, 0, normalizedJobId);
+  await getRedis().del(getJobKey(normalizedJobId));
+
+  return { id: normalizedJobId, deleted: true };
+}
+
+// Creates a fresh job that continues a failed/cancelled one from where it left
+// off (its confirmed-uploaded byte offset), then removes the old entry so the
+// list shows a single job moving forward. If the original "create" job had
+// already created its audience, the resume appends to that same audience
+// instead of creating a duplicate.
+export async function resumeAudienceUploadJob(jobId: string) {
+  const source = await getAudienceUploadJob(jobId);
+
+  // Back up 1 byte so the stream lands on the trailing newline of the last
+  // uploaded line and starts cleanly on the next, un-uploaded line.
+  const startOffsetBytes =
+    source.syncedByteOffset > 0 ? source.syncedByteOffset - 1 : 0;
+
+  const hasAudience = Boolean(source.audienceId);
+
+  const newJob = await createAudienceUploadJob({
+    kind: hasAudience ? "append" : source.kind,
+    nasFilePath: source.nasFilePath,
+    name: source.name,
+    description: source.description,
+    audienceId: hasAudience ? source.audienceId ?? undefined : undefined,
+    adAccountId: source.adAccountId ?? undefined,
+    tokenId: source.tokenId ?? undefined,
+    startOffsetBytes,
+    fileSize: source.fileSize,
+  });
+
+  await deleteAudienceUploadJob(jobId);
+
+  return newJob;
+}
+
 async function persistJob(job: AudienceUploadJob) {
   await getRedis().hset(getJobKey(job.id), toRedisHashPatch(job));
 }
@@ -200,8 +255,10 @@ function parseJobPayload(jobId: string, payload: Record<string, string>) {
     adAccountId: payload.adAccountId || null,
     tokenId: payload.tokenId || null,
     audienceId: payload.audienceId || null,
+    startOffsetBytes: parseInteger(payload.startOffsetBytes),
     syncedHashCount: parseInteger(payload.syncedHashCount),
     syncedLines: parseInteger(payload.syncedLines),
+    syncedByteOffset: parseInteger(payload.syncedByteOffset),
     processedLines: parseInteger(payload.processedLines),
     processedBytes: parseInteger(payload.processedBytes),
     totalLines: parseNullableInteger(payload.totalLines),

@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 
 import { getClientSafeError } from "@/app/api/audiences/meta";
-import { cancelAudienceUploadJob, getAudienceUploadJob } from "@/lib/audience-upload/jobs";
+import {
+  cancelAudienceUploadJob,
+  deleteAudienceUploadJob,
+  getAudienceUploadJob,
+} from "@/lib/audience-upload/jobs";
 import { removeAudienceUploadJob } from "@/lib/audience-upload/queue";
 
 export const dynamic = "force-dynamic";
@@ -41,15 +45,23 @@ export async function DELETE(
 ) {
   try {
     const { jobId } = await params;
-    const job = await cancelAudienceUploadJob(jobId);
-    // Remove from the queue so the worker never picks up / re-runs a cancelled job.
-    await removeAudienceUploadJob(jobId);
+    const existing = await getAudienceUploadJob(jobId);
 
-    return NextResponse.json({ job });
+    // Active job → cancel (worker stops cooperatively, queue entry removed).
+    if (existing.status === "queued" || existing.status === "processing") {
+      const job = await cancelAudienceUploadJob(jobId);
+      await removeAudienceUploadJob(jobId);
+      return NextResponse.json({ job });
+    }
+
+    // Terminal job (failed/completed/cancelled) → remove it from the list.
+    await removeAudienceUploadJob(jobId).catch(() => {});
+    const result = await deleteAudienceUploadJob(jobId);
+    return NextResponse.json(result);
   } catch (error) {
     const safeError = getClientSafeError(
       error,
-      "Không thể huỷ upload job."
+      "Không thể huỷ hoặc xoá upload job."
     );
 
     return NextResponse.json(

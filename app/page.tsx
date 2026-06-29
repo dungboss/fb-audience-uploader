@@ -10,6 +10,7 @@ import {
   Loader2,
   Plus,
   RefreshCcw,
+  RotateCcw,
   Search,
   StopCircle,
   Trash2,
@@ -136,8 +137,10 @@ type AudienceUploadJob = {
   nasFilePath: string;
   fileName: string;
   audienceId: string | null;
+  startOffsetBytes: number;
   syncedHashCount: number;
   syncedLines: number;
+  syncedByteOffset: number;
   processedLines: number;
   processedBytes: number;
   totalLines: number | null;
@@ -168,6 +171,8 @@ export default function Home() {
   const [audienceName, setAudienceName] = useState(() => generateAudienceName());
   const [description, setDescription] = useState("");
   const [createFile, setCreateFile] = useState<NasFileSelection | null>(null);
+  // Offset (in MB) to start uploading from — for resuming a file after a failure.
+  const [createStartOffsetMb, setCreateStartOffsetMb] = useState("");
   const [createProgress, setCreateProgress] = useState<ProgressState | null>(null);
   const [isCreateSubmitting, setIsCreateSubmitting] = useState(false);
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
@@ -226,10 +231,20 @@ export default function Home() {
   const [recentJobs, setRecentJobs] = useState<AudienceUploadJob[]>([]);
   const [isLoadingRecentJobs, setIsLoadingRecentJobs] = useState(false);
   const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
+  const [resumingJobId, setResumingJobId] = useState<string | null>(null);
+  const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
   const activeJobs = recentJobs.filter(
     (j) => j.status === "queued" || j.status === "processing"
   );
   const activeJobCount = activeJobs.length;
+  // Jobs shown in the live panel: active ones + recently failed (so the user can
+  // read the "uploaded MB" offset and resume a new job from there).
+  const displayedJobs = recentJobs.filter(
+    (j) =>
+      j.status === "queued" ||
+      j.status === "processing" ||
+      j.status === "failed"
+  );
 
   // Jobs whose terminal status we've already surfaced (avoid re-toasting on poll).
   const announcedDoneRef = useRef<Set<string>>(new Set());
@@ -643,8 +658,12 @@ export default function Home() {
                 });
                 void refreshAudiences({ silent: true });
               } else if (job.status === "failed") {
+                const offsetHint =
+                  job.syncedByteOffset > 0
+                    ? ` Đã up ${formatMb(job.syncedByteOffset)} — tạo job mới nhập offset ${Math.floor(job.syncedByteOffset / (1024 * 1024))} MB để up tiếp.`
+                    : "";
                 toast.error("Job upload thất bại.", {
-                  description: job.errorMessage || job.name || job.fileName,
+                  description: `${job.errorMessage || job.name || job.fileName}.${offsetHint}`,
                 });
               }
             }
@@ -683,6 +702,56 @@ export default function Home() {
       );
     } finally {
       setCancellingJobId(null);
+    }
+  }
+
+  // --- Resume a failed job from its uploaded offset (creates a new job) ---
+  async function handleResumeJob(jobId: string) {
+    setResumingJobId(jobId);
+    try {
+      const response = await fetch(`/api/upload-jobs/${jobId}/resume`, {
+        method: "POST",
+      });
+      const payload = await readJsonSafe<AudienceJobResponse>(response);
+      if (!response.ok || !payload.job) {
+        throw new Error(payload.error || "Không thể resume job.");
+      }
+      announcedDoneRef.current.delete(payload.job.id);
+      toast.success("Đã tạo job tiếp tục.", {
+        description: `Up tiếp từ ${formatMb(payload.job.startOffsetBytes)}.`,
+      });
+      void refreshRecentJobs();
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Không thể resume job."
+      );
+    } finally {
+      setResumingJobId(null);
+    }
+  }
+
+  // --- Delete a terminal job from the recent list ---
+  async function handleDeleteJob(jobId: string) {
+    setDeletingJobId(jobId);
+    try {
+      const response = await fetch(`/api/upload-jobs/${jobId}`, {
+        method: "DELETE",
+      });
+      const payload = await readJsonSafe<{ deleted?: boolean; error?: string }>(
+        response
+      );
+      if (!response.ok) {
+        throw new Error(payload.error || "Không thể xoá job.");
+      }
+      announcedDoneRef.current.add(jobId);
+      toast.success("Đã xoá job.");
+      void refreshRecentJobs();
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Không thể xoá job."
+      );
+    } finally {
+      setDeletingJobId(null);
     }
   }
 
@@ -747,6 +816,7 @@ export default function Home() {
     setAudienceName(generateAudienceName());
     setDescription("");
     setCreateFile(null);
+    setCreateStartOffsetMb("");
     setCreateProgress(null);
     setIsCreateDialogOpen(true);
   }
@@ -767,6 +837,12 @@ export default function Home() {
       return;
     }
 
+    const offsetMb = Number.parseFloat(createStartOffsetMb);
+    if (createStartOffsetMb.trim() && (!Number.isFinite(offsetMb) || offsetMb < 0)) {
+      toast.error("Offset bắt đầu (MB) không hợp lệ.");
+      return;
+    }
+
     const fileName = createFile.fileName;
     setIsCreateSubmitting(true);
 
@@ -777,6 +853,7 @@ export default function Home() {
         description: description.trim(),
         nasFilePath: createFile.nasFilePath,
         fileSize: createFile.fileSize,
+        startOffsetMb: createStartOffsetMb.trim() ? offsetMb : undefined,
       });
 
       // Queued — worker drains jobs one at a time. Close the dialog so the user
@@ -791,6 +868,7 @@ export default function Home() {
       setAudienceName(generateAudienceName());
       setDescription("");
       setCreateFile(null);
+      setCreateStartOffsetMb("");
       setCreateProgress(null);
       setIsCreateDialogOpen(false);
     } catch (error) {
@@ -961,6 +1039,11 @@ export default function Home() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  // Byte offset → MB, used for the "uploaded so far" resume hint.
+  function formatMb(bytes: number) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
   function formatAudienceSize(audience: Audience) {
     if (audience.sizeLowerBound === null && audience.sizeUpperBound === null) {
       return "Chưa xác định";
@@ -1090,6 +1173,7 @@ export default function Home() {
     audienceId?: string;
     nasFilePath: string;
     fileSize?: number | null;
+    startOffsetMb?: number;
   }) {
     const response = await fetch("/api/upload-jobs", {
       method: "POST",
@@ -1296,13 +1380,13 @@ export default function Home() {
         </header>
 
         <main className="space-y-8">
-          {activeJobs.length > 0 || isLoadingRecentJobs ? (
+          {displayedJobs.length > 0 || isLoadingRecentJobs ? (
             <Card className="rounded-[28px] border-white/60 bg-white/85 shadow-lg shadow-slate-950/5 backdrop-blur">
               <CardHeader>
                 <CardTitle className="text-lg">Job đang chạy / gần đây</CardTitle>
               </CardHeader>
               <CardContent>
-                {isLoadingRecentJobs && activeJobs.length === 0 ? (
+                {isLoadingRecentJobs && displayedJobs.length === 0 ? (
                   <div className="flex items-center justify-center gap-3 py-8 text-muted-foreground">
                     <Loader2 className="size-4 animate-spin" />
                     Đang tải...
@@ -1321,7 +1405,7 @@ export default function Home() {
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {activeJobs.map((job) => (
+                        {displayedJobs.map((job) => (
                           <TableRow key={job.id}>
                             <TableCell>
                               <div className="space-y-1">
@@ -1331,6 +1415,14 @@ export default function Home() {
                                 <p className="max-w-80 truncate text-xs text-muted-foreground">
                                   {job.nasFilePath}
                                 </p>
+                                {job.syncedByteOffset > 0 ? (
+                                  <p className="text-xs font-medium text-emerald-700">
+                                    Đã up: {formatMb(job.syncedByteOffset)}
+                                    {job.startOffsetBytes > 0
+                                      ? ` (bắt đầu từ ${formatMb(job.startOffsetBytes)})`
+                                      : ""}
+                                  </p>
+                                ) : null}
                               </div>
                             </TableCell>
                             <TableCell>
@@ -1369,31 +1461,96 @@ export default function Home() {
                                   Đang chờ...
                                 </span>
                               ) : null}
+                              {job.status === "failed" ? (
+                                <div className="max-w-56 space-y-1">
+                                  <span className="block text-xs text-destructive">
+                                    {job.errorMessage || "Job thất bại."}
+                                  </span>
+                                  <span className="block text-xs text-muted-foreground">
+                                    Tạo job mới cho cùng file, nhập offset{" "}
+                                    <span className="font-medium text-emerald-700">
+                                      {Math.floor(job.syncedByteOffset / (1024 * 1024))} MB
+                                    </span>{" "}
+                                    để up tiếp (làm tròn xuống cho an toàn).
+                                  </span>
+                                </div>
+                              ) : null}
                             </TableCell>
                             <TableCell className="text-xs text-muted-foreground">
                               {new Date(job.createdAt).toLocaleString("vi-VN")}
                             </TableCell>
                             <TableCell className="text-right">
                               <div className="flex items-center justify-end gap-2">
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => handleCancelJob(job.id)}
-                                  disabled={cancellingJobId === job.id}
-                                >
-                                  {cancellingJobId === job.id ? (
-                                    <>
-                                      <Loader2 className="size-3.5 animate-spin" />
-                                      Đang huỷ
-                                    </>
-                                  ) : (
-                                    <>
-                                      <StopCircle className="size-3.5" />
-                                      Huỷ
-                                    </>
-                                  )}
-                                </Button>
+                                {job.status === "queued" ||
+                                job.status === "processing" ? (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => handleCancelJob(job.id)}
+                                    disabled={cancellingJobId === job.id}
+                                  >
+                                    {cancellingJobId === job.id ? (
+                                      <>
+                                        <Loader2 className="size-3.5 animate-spin" />
+                                        Đang huỷ
+                                      </>
+                                    ) : (
+                                      <>
+                                        <StopCircle className="size-3.5" />
+                                        Huỷ
+                                      </>
+                                    )}
+                                  </Button>
+                                ) : null}
+                                {job.status === "failed" ? (
+                                  <>
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="sm"
+                                      onClick={() => handleResumeJob(job.id)}
+                                      disabled={
+                                        resumingJobId === job.id ||
+                                        deletingJobId === job.id
+                                      }
+                                    >
+                                      {resumingJobId === job.id ? (
+                                        <>
+                                          <Loader2 className="size-3.5 animate-spin" />
+                                          Đang tạo
+                                        </>
+                                      ) : (
+                                        <>
+                                          <RotateCcw className="size-3.5" />
+                                          Resume
+                                        </>
+                                      )}
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      variant="destructive"
+                                      size="sm"
+                                      onClick={() => handleDeleteJob(job.id)}
+                                      disabled={
+                                        deletingJobId === job.id ||
+                                        resumingJobId === job.id
+                                      }
+                                    >
+                                      {deletingJobId === job.id ? (
+                                        <>
+                                          <Loader2 className="size-3.5 animate-spin" />
+                                          Đang xoá
+                                        </>
+                                      ) : (
+                                        <>
+                                          <Trash2 className="size-3.5" />
+                                          Xoá
+                                        </>
+                                      )}
+                                    </Button>
+                                  </>
+                                ) : null}
                               </div>
                             </TableCell>
                           </TableRow>
@@ -1677,6 +1834,24 @@ export default function Home() {
               selection={createFile}
               onBrowseNas={() => openNasBrowser("create")}
             />
+            <div className="space-y-2">
+              <label className="text-sm font-medium">
+                Bắt đầu từ offset (MB){" "}
+                <span className="font-normal text-muted-foreground">
+                  — tùy chọn, để resume sau khi lỗi
+                </span>
+              </label>
+              <Input
+                type="number"
+                min={0}
+                step="any"
+                inputMode="decimal"
+                value={createStartOffsetMb}
+                onChange={(e) => setCreateStartOffsetMb(e.target.value)}
+                placeholder="0 = up từ đầu. VD: 5000 để bỏ qua 5000 MB đã up"
+                disabled={isCreateSubmitting}
+              />
+            </div>
             <ProgressPanel progress={createProgress} />
           </div>
 

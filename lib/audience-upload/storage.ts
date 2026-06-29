@@ -27,6 +27,12 @@ export async function getNasFileMeta(
 export interface StreamChunk {
   hashes: string[];
   bytesRead: number;
+  /**
+   * Absolute byte offset (from file start) up to which COMPLETE lines have been
+   * emitted — i.e. the start of the next, not-yet-complete line. A clean newline
+   * boundary safe to resume from.
+   */
+  endOffset: number;
 }
 
 export interface StreamNasFileLinesOptions {
@@ -35,6 +41,12 @@ export interface StreamNasFileLinesOptions {
    * the server doesn't return Content-Length on HEAD requests).
    */
   knownSize?: number | null;
+  /**
+   * Begin reading from this absolute byte offset instead of 0. A partial first
+   * line at the offset is discarded so the stream always starts on a clean line
+   * boundary. Requires the NAS to support Range requests.
+   */
+  startByte?: number;
 }
 
 export async function* streamNasFileLines(
@@ -48,10 +60,12 @@ export async function* streamNasFileLines(
   // still support Range — using knownSize keeps them on the resilient, resumable
   // 10MB-per-request path instead of one fragile long-lived stream.
   const totalBytes = head.contentLength ?? options.knownSize ?? null;
+  const startByte =
+    options.startByte && options.startByte > 0 ? options.startByte : 0;
 
   if (totalBytes !== null && totalBytes > 0) {
     try {
-      yield* streamViaRangeRequests(nasFilePath, totalBytes);
+      yield* streamViaRangeRequests(nasFilePath, totalBytes, startByte);
       return;
     } catch (error) {
       if (!(error instanceof WebDavRangeUnsupportedError)) {
@@ -64,16 +78,25 @@ export async function* streamNasFileLines(
     }
   }
 
+  // A start offset can only be honored via Range requests.
+  if (startByte > 0) {
+    throw new Error(
+      "NAS không hỗ trợ Range nên không thể bắt đầu upload từ offset đã chọn."
+    );
+  }
+
   // Fallback: no size known, or server doesn't support Range — stream the file.
   yield* streamViaFullRead(nasFilePath);
 }
 
 async function* streamViaRangeRequests(
   nasFilePath: string,
-  totalBytes: number
+  totalBytes: number,
+  startByte = 0
 ): AsyncGenerator<StreamChunk, void, void> {
-  let offset = 0;
+  let offset = startByte;
   let leftover = "";
+  let isFirstChunk = true;
 
   while (offset < totalBytes) {
     const end = Math.min(offset + NAS_CHUNK_BYTES - 1, totalBytes - 1);
@@ -82,9 +105,19 @@ async function* streamViaRangeRequests(
 
     let chunk = new TextDecoder("utf-8", { fatal: false }).decode(buffer);
 
-    // Remove BOM from the first chunk
-    if (offset === 0 && chunk.startsWith("\uFEFF")) {
-      chunk = chunk.slice(1);
+    if (isFirstChunk) {
+      if (startByte === 0) {
+        // Remove BOM from the very first chunk.
+        if (chunk.startsWith("\uFEFF")) {
+          chunk = chunk.slice(1);
+        }
+      } else {
+        // Starting mid-file: drop the partial first line so we begin on a clean
+        // boundary (everything up to the first newline is assumed already done).
+        const firstNewline = chunk.indexOf("\n");
+        chunk = firstNewline >= 0 ? chunk.slice(firstNewline + 1) : "";
+      }
+      isFirstChunk = false;
     }
 
     // Prepend leftover from previous chunk boundary
@@ -96,19 +129,18 @@ async function* streamViaRangeRequests(
 
     offset = end + 1;
 
-    if (lines.length > 0) {
-      const hashed = hashLines(lines);
-      if (hashed.length > 0) {
-        yield { hashes: hashed, bytesRead: chunkBytes };
-      }
-    }
+    // Absolute offset of the start of `leftover` = boundary of complete lines.
+    const endOffset = offset - Buffer.byteLength(leftover, "utf8");
+
+    const hashed = lines.length > 0 ? hashLines(lines) : [];
+    yield { hashes: hashed, bytesRead: chunkBytes, endOffset };
   }
 
   // Process final leftover line
   if (leftover.trim().length > 0) {
     const normalized = normalizeLineValue(leftover.trim());
     const hash = createHash("sha256").update(normalized).digest("hex");
-    yield { hashes: [hash], bytesRead: 0 };
+    yield { hashes: [hash], bytesRead: 0, endOffset: totalBytes };
   }
 }
 
@@ -118,6 +150,7 @@ async function* streamViaFullRead(
   const stream = await fetchWebDavFileStream(nasFilePath);
   const reader = stream.getReader();
   let leftover = "";
+  let absoluteOffset = 0;
 
   try {
     while (true) {
@@ -125,6 +158,7 @@ async function* streamViaFullRead(
       if (done) break;
 
       const chunkBytes = value.byteLength;
+      absoluteOffset += chunkBytes;
       const chunk = new TextDecoder("utf-8", { fatal: false }).decode(value);
 
       // Prepend leftover from previous chunk boundary
@@ -134,19 +168,16 @@ async function* streamViaFullRead(
       // The last line may be incomplete
       leftover = lines.pop() ?? "";
 
-      if (lines.length > 0) {
-        const hashed = hashLines(lines);
-        if (hashed.length > 0) {
-          yield { hashes: hashed, bytesRead: chunkBytes };
-        }
-      }
+      const endOffset = absoluteOffset - Buffer.byteLength(leftover, "utf8");
+      const hashed = lines.length > 0 ? hashLines(lines) : [];
+      yield { hashes: hashed, bytesRead: chunkBytes, endOffset };
     }
 
     // Process final leftover line
     if (leftover.trim().length > 0) {
       const normalized = normalizeLineValue(leftover.trim());
       const hash = createHash("sha256").update(normalized).digest("hex");
-      yield { hashes: [hash], bytesRead: 0 };
+      yield { hashes: [hash], bytesRead: 0, endOffset: absoluteOffset };
     }
   } finally {
     reader.releaseLock();
