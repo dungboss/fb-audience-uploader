@@ -62,6 +62,8 @@ async function main() {
       await patchAudienceUploadJob(jobId, {
         status: "processing",
         errorMessage: "",
+        // No longer waiting — clear any prior retry countdown.
+        nextRetryAt: null,
         updatedAt: new Date().toISOString(),
       });
       uploadJob = await getAudienceUploadJob(jobId);
@@ -209,15 +211,7 @@ async function main() {
           if (type !== "meta-aware") {
             return DEFAULT_RETRY_DELAY_MS;
           }
-
-          if (isMetaRateLimitRetryError(error)) {
-            return config.metaRateLimitDelayMs;
-          }
-
-          return Math.min(
-            DEFAULT_RETRY_DELAY_MS * 2 ** Math.max(attemptsMade - 1, 0),
-            config.metaRateLimitDelayMs
-          );
+          return metaAwareRetryDelayMs(attemptsMade, error);
         },
       },
     }
@@ -243,12 +237,16 @@ async function main() {
     if (jobId) {
       if (bullJob && shouldRetryLater(bullJob, error)) {
         const retryMessage = buildRetryMessage(error);
+        const nextRetryAt = new Date(
+          Date.now() + metaAwareRetryDelayMs(attemptsMade, error)
+        ).toISOString();
         console.info(
-          `[audience-upload-worker] retrying ${bullJobId} later (attempt ${attemptsMade}/${maxAttempts}): ${retryMessage}`
+          `[audience-upload-worker] retrying ${bullJobId} later (attempt ${attemptsMade}/${maxAttempts}, at ${nextRetryAt}): ${retryMessage}`
         );
         await patchAudienceUploadJob(jobId, {
           status: "queued",
           errorMessage: retryMessage,
+          nextRetryAt,
           updatedAt: new Date().toISOString(),
         });
       } else {
@@ -496,6 +494,20 @@ async function isJobCancelled(jobId: string) {
 
 function isMetaRateLimitRetryError(error: unknown) {
   return error instanceof Error && error.name === "MetaRateLimitRetryError";
+}
+
+// Delay (ms) before BullMQ retries a meta-aware job: full rate-limit cooldown
+// for #2650 / rate limits / proactive pauses, else exponential backoff capped at
+// the cooldown. Shared by the backoff strategy and the UI retry countdown.
+function metaAwareRetryDelayMs(attemptsMade: number, error: unknown): number {
+  const { metaRateLimitDelayMs } = getAudienceUploadConfig();
+  if (isMetaRateLimitRetryError(error)) {
+    return metaRateLimitDelayMs;
+  }
+  return Math.min(
+    DEFAULT_RETRY_DELAY_MS * 2 ** Math.max(attemptsMade - 1, 0),
+    metaRateLimitDelayMs
+  );
 }
 
 function shouldRetryLater(

@@ -147,6 +147,7 @@ type AudienceUploadJob = {
   totalBytes: number | null;
   lastSessionId: string | null;
   errorMessage: string | null;
+  nextRetryAt: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -1044,6 +1045,26 @@ export default function Home() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
+  // Builds the "resuming at HH:MM (in ~N)" label for a job waiting to retry.
+  function formatRetryWait(nextRetryAt: string) {
+    const targetMs = new Date(nextRetryAt).getTime();
+    const timeLabel = new Date(nextRetryAt).toLocaleString("vi-VN");
+    const diffMs = targetMs - Date.now();
+
+    if (!Number.isFinite(targetMs)) return null;
+    if (diffMs <= 0) return `Sắp up tiếp (dự kiến ${timeLabel})`;
+
+    const totalMinutes = Math.ceil(diffMs / 60000);
+    const relative =
+      totalMinutes >= 60
+        ? `${Math.floor(totalMinutes / 60)}h${
+            totalMinutes % 60 ? ` ${totalMinutes % 60}p` : ""
+          }`
+        : `${totalMinutes} phút`;
+
+    return `Up tiếp lúc ${timeLabel} (còn ~${relative})`;
+  }
+
   function formatAudienceSize(audience: Audience) {
     if (audience.sizeLowerBound === null && audience.sizeUpperBound === null) {
       return "Chưa xác định";
@@ -1274,9 +1295,6 @@ export default function Home() {
             <h1 className="text-3xl font-bold tracking-tight text-slate-900">
               Facebook Audience Uploader
             </h1>
-            <p className="mt-2 text-muted-foreground">
-              Đồng bộ Custom Audience từ file trên NAS lên Meta Ads.
-            </p>
           </div>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
             <div className="flex flex-col gap-1.5">
@@ -1457,9 +1475,20 @@ export default function Home() {
                                 </div>
                               ) : null}
                               {job.status === "queued" ? (
-                                <span className="text-xs text-muted-foreground">
-                                  Đang chờ...
-                                </span>
+                                job.nextRetryAt ? (
+                                  <div className="max-w-56 space-y-0.5">
+                                    <span className="block text-xs font-medium text-amber-700">
+                                      Đang nghỉ chờ Meta
+                                    </span>
+                                    <span className="block text-xs text-muted-foreground">
+                                      {formatRetryWait(job.nextRetryAt)}
+                                    </span>
+                                  </div>
+                                ) : (
+                                  <span className="text-xs text-muted-foreground">
+                                    Đang chờ tới lượt...
+                                  </span>
+                                )
                               ) : null}
                               {job.status === "failed" ? (
                                 <div className="max-w-56 space-y-1">

@@ -39,6 +39,10 @@ export interface AudienceUploadJob {
   totalBytes: number | null;
   lastSessionId: string | null;
   errorMessage: string | null;
+  // When the worker is waiting (after #2650 / rate limit / proactive pause)
+  // before retrying — ISO timestamp the upload is expected to resume at. Null
+  // when not waiting. Lets the UI show a countdown to the next attempt.
+  nextRetryAt: string | null;
   createdAt: string;
   updatedAt: string;
 }

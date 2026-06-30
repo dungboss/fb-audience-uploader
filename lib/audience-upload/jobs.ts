@@ -76,6 +76,7 @@ export async function createAudienceUploadJob(input: {
     totalBytes: null,
     lastSessionId: null,
     errorMessage: null,
+    nextRetryAt: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -119,6 +120,7 @@ export async function patchAudienceUploadJob(
       | "syncedByteOffset"
       | "lastSessionId"
       | "errorMessage"
+      | "nextRetryAt"
       | "updatedAt"
     >
   >
@@ -265,6 +267,7 @@ function parseJobPayload(jobId: string, payload: Record<string, string>) {
     totalBytes: parseNullableInteger(payload.totalBytes),
     lastSessionId: payload.lastSessionId || null,
     errorMessage: payload.errorMessage || null,
+    nextRetryAt: payload.nextRetryAt || null,
     createdAt: payload.createdAt ?? new Date(0).toISOString(),
     updatedAt: payload.updatedAt ?? new Date(0).toISOString(),
   } satisfies AudienceUploadJob;
