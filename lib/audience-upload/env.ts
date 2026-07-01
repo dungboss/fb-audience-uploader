@@ -76,7 +76,10 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
     jobTtlSeconds: readNumberEnv("UPLOAD_JOB_TTL_SECONDS", 24 * 60 * 60),
     presignedUrlTtlSeconds: readNumberEnv("UPLOAD_PRESIGN_TTL_SECONDS", 15 * 60),
     jobAttempts: readNumberEnv("UPLOAD_JOB_ATTEMPTS", 168),
-    workerConcurrency: readNumberEnv("UPLOAD_WORKER_CONCURRENCY", 1),
+    // Upper bound on jobs processed in parallel. The worker also enforces at
+    // most one job per app_id, so effective parallelism = min(this, #apps with
+    // pending jobs). Bump if you have more than a few apps.
+    workerConcurrency: readNumberEnv("UPLOAD_WORKER_CONCURRENCY", 4),
     workerRateLimitMax: readNumberEnv("UPLOAD_WORKER_RATE_LIMIT_MAX", 1),
     workerRateLimitDurationMs: readNumberEnv(
       "UPLOAD_WORKER_RATE_LIMIT_DURATION_MS",

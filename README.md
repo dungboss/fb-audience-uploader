@@ -79,6 +79,16 @@ file. The suggested value is rounded **down** on purpose: starting slightly earl
 re-sends a few already-uploaded rows (Meta de-duplicates by hash), whereas
 starting too late would skip data. Requires a NAS that supports HTTP Range.
 
+## Per-app upload concurrency
+
+The worker runs **at most one job per app_id at a time**, while jobs belonging to
+different apps run in parallel. Each app also has its own Meta request throttle,
+so two apps upload at full independent rates instead of sharing one global gate.
+A job whose app is already busy is deferred (no retry attempt consumed) until the
+app frees up. Set `UPLOAD_WORKER_CONCURRENCY` to at least the number of apps you
+upload with (default 4). Concurrency is coordinated in-memory, so run a single
+worker process.
+
 ## NAS WebDAV
 
 The dashboard can browse files from a NAS WebDAV endpoint and load them into the upload flow.

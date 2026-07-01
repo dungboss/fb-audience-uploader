@@ -1,4 +1,4 @@
-import { UnrecoverableError, Worker } from "bullmq";
+import { DelayedError, UnrecoverableError, Worker } from "bullmq";
 
 import {
   createEmptyAudience,
@@ -21,6 +21,7 @@ import {
   getNasFileMeta,
   streamNasFileLines,
 } from "../lib/audience-upload/storage";
+import { getFbTokenAppId } from "../lib/audience-upload/token-store";
 import {
   describeFetchError,
   isTransientFetchError,
@@ -28,13 +29,34 @@ import {
 import type { AudienceUploadJobPayload } from "../lib/audience-upload/types";
 
 const DEFAULT_RETRY_DELAY_MS = 5_000;
-const META_REQUEST_THROTTLE_KEY = "audience-upload:meta-request-throttle";
+// Per-app Meta request throttle: one self-expiring key per app so different
+// apps pace independently (and can upload in parallel).
+const META_REQUEST_THROTTLE_PREFIX = "audience-upload:meta-request-throttle";
+// A job whose app is already busy is deferred by this long, then retried.
+const APP_BUSY_RETRY_DELAY_MS = 10_000;
+
+// App keys currently being processed by THIS worker process. Enforces "at most
+// one job per app_id at a time" while letting different apps run concurrently.
+// In-memory is sufficient because a single Worker runs all concurrent handlers
+// in one process; BullMQ already prevents two workers from taking the same job.
+const activeAppKeys = new Set<string>();
+
+// Resolves the concurrency/throttle bucket for a job: its token's app_id when
+// available, else the token id, else the .env-default bucket.
+async function resolveAppKey(tokenId: string | null): Promise<string> {
+  const normalizedTokenId = tokenId?.trim();
+  if (normalizedTokenId) {
+    const appId = await getFbTokenAppId(normalizedTokenId);
+    return appId ? `app:${appId}` : `token:${normalizedTokenId}`;
+  }
+  return "env-default";
+}
 
 async function main() {
   const config = getAudienceUploadConfig();
   const worker = new Worker<AudienceUploadJobPayload>(
     config.queueName,
-    async (bullJob) => {
+    async (bullJob, token) => {
       const { jobId } = bullJob.data;
       let uploadJob = await getAudienceUploadJob(jobId);
 
@@ -59,6 +81,20 @@ async function main() {
         };
       }
 
+      // Per-app concurrency gate: at most one job per app_id processes at a
+      // time; a same-app job is deferred (no attempt consumed) so the worker
+      // can run other apps' jobs meanwhile.
+      const appKey = await resolveAppKey(uploadJob.tokenId);
+      if (activeAppKeys.has(appKey)) {
+        console.info(
+          `[audience-upload-worker] job ${jobId} deferred: ${appKey} busy`
+        );
+        await bullJob.moveToDelayed(Date.now() + APP_BUSY_RETRY_DELAY_MS, token);
+        throw new DelayedError();
+      }
+      activeAppKeys.add(appKey);
+
+      try {
       await patchAudienceUploadJob(jobId, {
         status: "processing",
         errorMessage: "",
@@ -127,6 +163,7 @@ async function main() {
           resume,
           uploadJob.tokenId ?? undefined,
           uploadJob.startOffsetBytes,
+          appKey,
           async (progress) => {
             // Cooperative cancel: stop streaming/uploading if the job was cancelled.
             if (await isJobCancelled(jobId)) {
@@ -197,6 +234,11 @@ async function main() {
         throw new UnrecoverableError(
           error instanceof Error ? error.message : String(error)
         );
+      }
+      } finally {
+        // Release the app so another job for the same app_id can run. A job
+        // that threw for retry frees the app now and re-acquires on its retry.
+        activeAppKeys.delete(appKey);
       }
     },
     {
@@ -292,6 +334,7 @@ async function syncLinesFromNas(
   resume: { syncedLines: number; syncedHashCount: number; syncedByteOffset: number },
   tokenId: string | undefined,
   startOffsetBytes: number,
+  appKey: string,
   onProgress: (progress: SyncProgress) => Promise<void>
 ) {
   // metaBatchSize is configurable via UPLOAD_META_BATCH_SIZE (Meta documents 10,000/call).
@@ -354,7 +397,7 @@ async function syncLinesFromNas(
     while (accumulator.length >= metaBatchSize) {
       const batch = accumulator.splice(0, metaBatchSize);
 
-      await acquireMetaRequestSlot(metaRequestIntervalMs);
+      await acquireMetaRequestSlot(metaRequestIntervalMs, appKey);
 
       const result = await retryMetaAware(() =>
         uploadHashedUsers(audienceId, batch, { tokenId })
@@ -393,7 +436,7 @@ async function syncLinesFromNas(
 
   // Flush remaining accumulator
   if (accumulator.length > 0) {
-    await acquireMetaRequestSlot(metaRequestIntervalMs);
+    await acquireMetaRequestSlot(metaRequestIntervalMs, appKey);
 
     const result = await retryMetaAware(() =>
       uploadHashedUsers(audienceId, accumulator, { tokenId })
@@ -451,23 +494,18 @@ async function retryMetaAware<T>(callback: () => Promise<T>) {
 // minimum `intervalMs` between Meta requests. The key auto-expires after
 // `intervalMs`, so the next acquirer either grabs it (NX) or sleeps for exactly
 // the remaining TTL before retrying.
-async function acquireMetaRequestSlot(intervalMs: number) {
+async function acquireMetaRequestSlot(intervalMs: number, appKey: string) {
   const redis = getRedis();
+  const throttleKey = `${META_REQUEST_THROTTLE_PREFIX}:${appKey}`;
 
   while (true) {
-    const acquired = await redis.set(
-      META_REQUEST_THROTTLE_KEY,
-      "1",
-      "PX",
-      intervalMs,
-      "NX"
-    );
+    const acquired = await redis.set(throttleKey, "1", "PX", intervalMs, "NX");
 
     if (acquired === "OK") {
       return;
     }
 
-    const remainingTtlMs = await redis.pttl(META_REQUEST_THROTTLE_KEY);
+    const remainingTtlMs = await redis.pttl(throttleKey);
     await waitFor(remainingTtlMs > 0 ? remainingTtlMs : 100);
   }
 }
