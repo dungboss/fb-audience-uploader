@@ -19,6 +19,10 @@ export interface AudienceUploadJob {
   // Ad account this job targets, snapshotted at creation so the worker (a
   // separate process) creates the audience under the account the user picked.
   adAccountId: string | null;
+  // Display names snapshotted at creation for the jobs list (ad account name +
+  // the token's app label). Null for older jobs / when unavailable.
+  adAccountName: string | null;
+  appName: string | null;
   // Access token (id reference into the encrypted token store) this job uses.
   // Snapshotted so the worker resolves the same token the user picked. Empty =
   // fall back to FACEBOOK_ACCESS_TOKEN in .env.

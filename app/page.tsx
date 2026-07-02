@@ -137,6 +137,9 @@ type AudienceUploadJob = {
   nasFilePath: string;
   fileName: string;
   audienceId: string | null;
+  adAccountId: string | null;
+  adAccountName: string | null;
+  appName: string | null;
   startOffsetBytes: number;
   syncedHashCount: number;
   syncedLines: number;
@@ -1045,24 +1048,21 @@ export default function Home() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
-  // Builds the "resuming at HH:MM (in ~N)" label for a job waiting to retry.
+  // Builds the "còn N phút" countdown label for a job waiting to retry.
   function formatRetryWait(nextRetryAt: string) {
     const targetMs = new Date(nextRetryAt).getTime();
-    const timeLabel = new Date(nextRetryAt).toLocaleString("vi-VN");
-    const diffMs = targetMs - Date.now();
-
     if (!Number.isFinite(targetMs)) return null;
-    if (diffMs <= 0) return `Sắp up tiếp (dự kiến ${timeLabel})`;
+
+    const diffMs = targetMs - Date.now();
+    if (diffMs <= 0) return "Sắp up tiếp";
 
     const totalMinutes = Math.ceil(diffMs / 60000);
-    const relative =
-      totalMinutes >= 60
-        ? `${Math.floor(totalMinutes / 60)}h${
-            totalMinutes % 60 ? ` ${totalMinutes % 60}p` : ""
-          }`
-        : `${totalMinutes} phút`;
-
-    return `Up tiếp lúc ${timeLabel} (còn ~${relative})`;
+    if (totalMinutes >= 60) {
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      return `còn ${hours}h${minutes ? ` ${minutes} phút` : ""}`;
+    }
+    return `còn ${totalMinutes} phút`;
   }
 
   function formatAudienceSize(audience: Audience) {
@@ -1196,15 +1196,22 @@ export default function Home() {
     fileSize?: number | null;
     startOffsetMb?: number;
   }) {
+    const selectedAdAccount = adAccounts.find(
+      (account) => account.id === selectedAdAccountId
+    );
+    const selectedToken = tokens.find((token) => token.id === selectedTokenId);
     const response = await fetch("/api/upload-jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // Snapshot the picked ad account + token onto the job so the worker
       // creates the audience under the right account using the right token
-      // (append jobs ignore the ad account harmlessly).
+      // (append jobs ignore the ad account harmlessly). Names are snapshotted
+      // for display in the jobs list.
       body: JSON.stringify({
         ...input,
         adAccountId: selectedAdAccountId,
+        adAccountName: selectedAdAccount?.name,
+        appName: selectedToken?.label,
         tokenId: selectedTokenId,
       }),
     });
@@ -1410,27 +1417,27 @@ export default function Home() {
                     Đang tải...
                   </div>
                 ) : (
-                  <div className="overflow-hidden rounded-2xl border">
+                  <div className="overflow-x-auto rounded-2xl border">
                     <Table>
                       <TableHeader>
-                        <TableRow className="bg-muted/35">
+                        <TableRow className="bg-muted/35 [&>th]:whitespace-nowrap">
                           <TableHead>Tên / File</TableHead>
+                          <TableHead>TK QC / App</TableHead>
                           <TableHead>Loại</TableHead>
-                          <TableHead>Trạng thái</TableHead>
-                          <TableHead>Tiến độ</TableHead>
+                          <TableHead>Trạng thái / Tiến độ</TableHead>
                           <TableHead>Thời gian</TableHead>
                           <TableHead className="text-right">Theo dõi</TableHead>
                         </TableRow>
                       </TableHeader>
                       <TableBody>
                         {displayedJobs.map((job) => (
-                          <TableRow key={job.id}>
+                          <TableRow key={job.id} className="align-top">
                             <TableCell>
-                              <div className="space-y-1">
-                                <p className="text-sm font-medium">
+                              <div className="w-56 space-y-1">
+                                <p className="truncate text-sm font-medium" title={job.name || job.fileName}>
                                   {job.name || job.fileName}
                                 </p>
-                                <p className="max-w-80 truncate text-xs text-muted-foreground">
+                                <p className="truncate text-xs text-muted-foreground" title={job.nasFilePath}>
                                   {job.nasFilePath}
                                 </p>
                                 {job.syncedByteOffset > 0 ? (
@@ -1443,15 +1450,30 @@ export default function Home() {
                                 ) : null}
                               </div>
                             </TableCell>
+                            <TableCell className="text-sm">
+                              <div className="max-w-40 space-y-0.5">
+                                <div
+                                  className="truncate font-medium"
+                                  title={job.adAccountName || job.adAccountId || undefined}
+                                >
+                                  {job.adAccountName || job.adAccountId || "—"}
+                                </div>
+                                <div
+                                  className="truncate text-xs text-muted-foreground"
+                                  title={job.appName || undefined}
+                                >
+                                  {job.appName || "—"}
+                                </div>
+                              </div>
+                            </TableCell>
                             <TableCell>
                               <Badge variant="outline">
                                 {job.kind === "create" ? "Tạo mới" : "Nạp thêm"}
                               </Badge>
                             </TableCell>
                             <TableCell>
-                              <JobStatusBadge status={job.status} />
-                            </TableCell>
-                            <TableCell>
+                              <div className="space-y-1.5">
+                                <JobStatusBadge status={job.status} />
                               {job.status === "processing" ? (
                                 <div className="max-w-32">
                                   <Progress
@@ -1478,16 +1500,16 @@ export default function Home() {
                                 job.nextRetryAt ? (
                                   <div className="max-w-56 space-y-0.5">
                                     <span className="block text-xs font-medium text-amber-700">
-                                      Đang nghỉ chờ Meta
+                                      Meta Limit
                                     </span>
                                     <span className="block text-xs text-muted-foreground">
                                       {formatRetryWait(job.nextRetryAt)}
                                     </span>
                                   </div>
                                 ) : (
-                                  <span className="text-xs text-muted-foreground">
+                                  <div className="text-xs text-muted-foreground">
                                     Đang chờ tới lượt...
-                                  </span>
+                                  </div>
                                 )
                               ) : null}
                               {job.status === "failed" ? (
@@ -1504,8 +1526,9 @@ export default function Home() {
                                   </span>
                                 </div>
                               ) : null}
+                              </div>
                             </TableCell>
-                            <TableCell className="text-xs text-muted-foreground">
+                            <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                               {new Date(job.createdAt).toLocaleString("vi-VN")}
                             </TableCell>
                             <TableCell className="text-right">

@@ -43,6 +43,8 @@ export async function POST(request: Request) {
       nasFilePath?: unknown;
       audienceId?: unknown;
       adAccountId?: unknown;
+      adAccountName?: unknown;
+      appName?: unknown;
       tokenId?: unknown;
       startOffsetMb?: unknown;
       fileSize?: unknown;
@@ -65,6 +67,9 @@ export async function POST(request: Request) {
         typeof body.audienceId === "string" ? body.audienceId : undefined,
       adAccountId:
         typeof body.adAccountId === "string" ? body.adAccountId : undefined,
+      adAccountName:
+        typeof body.adAccountName === "string" ? body.adAccountName : undefined,
+      appName: typeof body.appName === "string" ? body.appName : undefined,
       tokenId: typeof body.tokenId === "string" ? body.tokenId : undefined,
       startOffsetBytes,
       fileSize:

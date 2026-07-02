@@ -22,6 +22,8 @@ export async function createAudienceUploadJob(input: {
   description?: string;
   audienceId?: string;
   adAccountId?: string;
+  adAccountName?: string;
+  appName?: string;
   tokenId?: string;
   startOffsetBytes?: number;
   fileSize?: number | null;
@@ -32,6 +34,8 @@ export async function createAudienceUploadJob(input: {
   const description = input.description?.trim() ?? "";
   const audienceId = input.audienceId?.trim() ?? "";
   const adAccountId = input.adAccountId?.trim() ?? "";
+  const adAccountName = input.adAccountName?.trim() ?? "";
+  const appName = input.appName?.trim() ?? "";
   const tokenId = input.tokenId?.trim() ?? "";
   const startOffsetBytes =
     typeof input.startOffsetBytes === "number" && input.startOffsetBytes > 0
@@ -64,6 +68,8 @@ export async function createAudienceUploadJob(input: {
     fileName,
     fileSize: typeof input.fileSize === "number" && input.fileSize > 0 ? input.fileSize : null,
     adAccountId: adAccountId || null,
+    adAccountName: adAccountName || null,
+    appName: appName || null,
     tokenId: tokenId || null,
     audienceId: kind === "append" ? audienceId : null,
     startOffsetBytes,
@@ -221,6 +227,8 @@ export async function resumeAudienceUploadJob(jobId: string) {
     description: source.description,
     audienceId: hasAudience ? source.audienceId ?? undefined : undefined,
     adAccountId: source.adAccountId ?? undefined,
+    adAccountName: source.adAccountName ?? undefined,
+    appName: source.appName ?? undefined,
     tokenId: source.tokenId ?? undefined,
     startOffsetBytes,
     fileSize: source.fileSize,
@@ -255,6 +263,8 @@ function parseJobPayload(jobId: string, payload: Record<string, string>) {
     fileName: payload.fileName ?? "",
     fileSize: parseNullableInteger(payload.fileSize),
     adAccountId: payload.adAccountId || null,
+    adAccountName: payload.adAccountName || null,
+    appName: payload.appName || null,
     tokenId: payload.tokenId || null,
     audienceId: payload.audienceId || null,
     startOffsetBytes: parseInteger(payload.startOffsetBytes),
