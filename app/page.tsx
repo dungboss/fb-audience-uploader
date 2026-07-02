@@ -1422,11 +1422,10 @@ export default function Home() {
                       <TableHeader>
                         <TableRow className="bg-muted/35 [&>th]:whitespace-nowrap">
                           <TableHead>Tên / File</TableHead>
-                          <TableHead>TK QC / App</TableHead>
-                          <TableHead>Loại</TableHead>
                           <TableHead>Trạng thái / Tiến độ</TableHead>
-                          <TableHead>Thời gian</TableHead>
-                          <TableHead className="text-right">Theo dõi</TableHead>
+                          <TableHead>TK QC / App</TableHead>
+                          <TableHead>Loại / Thời gian</TableHead>
+                          <TableHead>Theo dõi</TableHead>
                         </TableRow>
                       </TableHeader>
                       <TableBody>
@@ -1438,7 +1437,7 @@ export default function Home() {
                                   {job.name || job.fileName}
                                 </p>
                                 <p className="truncate text-xs text-muted-foreground" title={job.nasFilePath}>
-                                  {job.nasFilePath}
+                                  {job.fileName}
                                 </p>
                                 {job.syncedByteOffset > 0 ? (
                                   <p className="text-xs font-medium text-emerald-700">
@@ -1449,27 +1448,6 @@ export default function Home() {
                                   </p>
                                 ) : null}
                               </div>
-                            </TableCell>
-                            <TableCell className="text-sm">
-                              <div className="max-w-40 space-y-0.5">
-                                <div
-                                  className="truncate font-medium"
-                                  title={job.adAccountName || job.adAccountId || undefined}
-                                >
-                                  {job.adAccountName || job.adAccountId || "—"}
-                                </div>
-                                <div
-                                  className="truncate text-xs text-muted-foreground"
-                                  title={job.appName || undefined}
-                                >
-                                  {job.appName || "—"}
-                                </div>
-                              </div>
-                            </TableCell>
-                            <TableCell>
-                              <Badge variant="outline">
-                                {job.kind === "create" ? "Tạo mới" : "Nạp thêm"}
-                              </Badge>
                             </TableCell>
                             <TableCell>
                               <div className="space-y-1.5">
@@ -1528,11 +1506,34 @@ export default function Home() {
                               ) : null}
                               </div>
                             </TableCell>
-                            <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
-                              {new Date(job.createdAt).toLocaleString("vi-VN")}
+                            <TableCell className="text-sm">
+                              <div className="max-w-40 space-y-0.5">
+                                <div
+                                  className="truncate font-medium"
+                                  title={job.adAccountName || job.adAccountId || undefined}
+                                >
+                                  {job.adAccountName || job.adAccountId || "—"}
+                                </div>
+                                <div
+                                  className="truncate text-xs text-muted-foreground"
+                                  title={job.appName || undefined}
+                                >
+                                  {job.appName || "—"}
+                                </div>
+                              </div>
                             </TableCell>
-                            <TableCell className="text-right">
-                              <div className="flex items-center justify-end gap-2">
+                            <TableCell className="whitespace-nowrap">
+                              <div className="space-y-1">
+                                <Badge variant="outline">
+                                  {job.kind === "create" ? "Tạo mới" : "Nạp thêm"}
+                                </Badge>
+                                <div className="text-xs text-muted-foreground">
+                                  {new Date(job.createdAt).toLocaleString("vi-VN")}
+                                </div>
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex items-center justify-start gap-2">
                                 {job.status === "queued" ||
                                 job.status === "processing" ? (
                                   <Button
