@@ -7,6 +7,7 @@ import {
   Download,
   FolderOpen,
   HardDrive,
+  Layers,
   KeyRound,
   Loader2,
   Plus,
@@ -56,6 +57,7 @@ import {
   LocalFileBrowserDialog,
   fetchLocalFileListing,
 } from "@/components/local-file-browser-dialog";
+import { BulkCreateAudiencesDialog } from "@/components/bulk-create-audiences-dialog";
 
 const numberFormatter = new Intl.NumberFormat("vi-VN");
 
@@ -239,6 +241,7 @@ export default function Home() {
   const [isNasBrowserOpen, setIsNasBrowserOpen] = useState(false);
   const [nasBrowserPath, setNasBrowserPath] = useState("/");
   const [isLocalBrowserOpen, setIsLocalBrowserOpen] = useState(false);
+  const [isBulkCreateOpen, setIsBulkCreateOpen] = useState(false);
   // False hides the local-file button entirely (LOCAL_FILE_ROOT unset on server).
   const [isLocalSourceEnabled, setIsLocalSourceEnabled] = useState(false);
 
@@ -1501,6 +1504,26 @@ export default function Home() {
                 )}
               </div>
             </div>
+
+            {/* Bulk creation spreads jobs over ALL ad accounts, so it sits next
+                to the account picker rather than in the audience toolbar.
+                Hidden unless the local file source is configured. */}
+            {isLocalSourceEnabled ? (
+              <div className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-muted-foreground">
+                  Hàng loạt
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-10 rounded-xl"
+                  onClick={() => setIsBulkCreateOpen(true)}
+                >
+                  <Layers className="size-4" />
+                  Tạo hàng loạt
+                </Button>
+              </div>
+            ) : null}
           </div>
         </header>
 
@@ -2258,6 +2281,12 @@ export default function Home() {
         isOpen={isLocalBrowserOpen}
         onClose={closeLocalBrowser}
         onSelectFile={handleLocalFileSelected}
+      />
+
+      <BulkCreateAudiencesDialog
+        isOpen={isBulkCreateOpen}
+        onClose={() => setIsBulkCreateOpen(false)}
+        onCreated={() => void refreshRecentJobs()}
       />
 
       <AlertDialog
