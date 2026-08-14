@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { FacebookApiError } from "@/app/api/audiences/meta";
+import { LocalFileError, statLocalFile } from "@/lib/local-files.server";
 
 import { getAudienceUploadConfig } from "./env";
 import { getRedis } from "./redis";
@@ -8,6 +9,7 @@ import type {
   AudienceUploadJob,
   AudienceUploadJobKind,
   AudienceUploadJobStatus,
+  AudienceUploadSourceType,
 } from "./types";
 
 const JOB_KEY_PREFIX = "audience-upload:job:";
@@ -17,6 +19,7 @@ const MAX_RECENT_JOBS = 20;
 
 export async function createAudienceUploadJob(input: {
   kind: AudienceUploadJobKind;
+  sourceType?: AudienceUploadSourceType;
   nasFilePath: string;
   name?: string;
   description?: string;
@@ -29,6 +32,8 @@ export async function createAudienceUploadJob(input: {
   fileSize?: number | null;
 }) {
   const kind = input.kind;
+  const sourceType: AudienceUploadSourceType =
+    input.sourceType === "local" ? "local" : "nas";
   const nasFilePath = input.nasFilePath.trim();
   const name = input.name?.trim() ?? "";
   const description = input.description?.trim() ?? "";
@@ -43,7 +48,22 @@ export async function createAudienceUploadJob(input: {
       : 0;
 
   if (!nasFilePath) {
-    throw new FacebookApiError("Đường dẫn file trên NAS không hợp lệ.", 400);
+    throw new FacebookApiError("Đường dẫn file không hợp lệ.", 400);
+  }
+
+  // Local jobs store only a file name. Stat it now so a bad pick fails
+  // immediately (with the real size on hand) instead of hours later in the
+  // worker — which still re-checks, since the file can change while queued.
+  let localFileSize: number | null = null;
+  if (sourceType === "local") {
+    try {
+      localFileSize = await statLocalFile(nasFilePath);
+    } catch (error) {
+      if (error instanceof LocalFileError) {
+        throw new FacebookApiError(error.message, 400);
+      }
+      throw error;
+    }
   }
 
   if (kind === "create" && !name) {
@@ -64,9 +84,15 @@ export async function createAudienceUploadJob(input: {
     status: "queued",
     name,
     description,
+    sourceType,
     nasFilePath,
     fileName,
-    fileSize: typeof input.fileSize === "number" && input.fileSize > 0 ? input.fileSize : null,
+    // Local files trust fs.stat over whatever the browser reported.
+    fileSize:
+      localFileSize ??
+      (typeof input.fileSize === "number" && input.fileSize > 0
+        ? input.fileSize
+        : null),
     adAccountId: adAccountId || null,
     adAccountName: adAccountName || null,
     appName: appName || null,
@@ -222,6 +248,7 @@ export async function resumeAudienceUploadJob(jobId: string) {
 
   const newJob = await createAudienceUploadJob({
     kind: hasAudience ? "append" : source.kind,
+    sourceType: source.sourceType,
     nasFilePath: source.nasFilePath,
     name: source.name,
     description: source.description,
@@ -259,6 +286,8 @@ function parseJobPayload(jobId: string, payload: Record<string, string>) {
     ) as AudienceUploadJobStatus,
     name: payload.name ?? "",
     description: payload.description ?? "",
+    // Jobs written before local sources existed carry no sourceType — NAS.
+    sourceType: parseEnum(payload.sourceType, ["nas", "local"], "nas"),
     nasFilePath: payload.nasFilePath ?? "",
     fileName: payload.fileName ?? "",
     fileSize: parseNullableInteger(payload.fileSize),

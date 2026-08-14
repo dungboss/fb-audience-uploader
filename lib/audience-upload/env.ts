@@ -29,6 +29,9 @@ export interface AudienceUploadConfig {
   proactivePauseBytes: number;
   webdavUsername?: string;
   webdavPassword?: string;
+  // Absolute path of the single folder local files may be picked from. Unset =
+  // the local-file feature is off (the UI hides the button entirely).
+  localFileRoot?: string;
 }
 
 let cachedConfig: AudienceUploadConfig | null = null;
@@ -95,6 +98,7 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
     proactivePauseBytes,
     webdavUsername: readOptionalEnv("WEBDAV_USERNAME"),
     webdavPassword: readOptionalEnv("WEBDAV_PASSWORD"),
+    localFileRoot: readOptionalEnv("LOCAL_FILE_ROOT"),
   };
 
   return cachedConfig;

@@ -18,9 +18,10 @@ import {
   getRedis,
 } from "../lib/audience-upload/redis";
 import {
-  getNasFileMeta,
-  streamNasFileLines,
-} from "../lib/audience-upload/storage";
+  getFileSourceMeta,
+  streamFileSourceLines,
+  type FileSourceRef,
+} from "../lib/audience-upload/file-source";
 import {
   describeFetchError,
   isTransientFetchError,
@@ -155,19 +156,24 @@ async function main() {
           throw new Error("Worker chưa có audienceId để sync dữ liệu lên Meta.");
         }
 
-        // Get file metadata
-        const fileMeta = await getNasFileMeta(uploadJob.nasFilePath);
+        // Get file metadata. Re-checked here (not only at job creation) because
+        // the file can be moved/deleted/replaced while the job waits in queue.
+        const fileSource: FileSourceRef = {
+          sourceType: uploadJob.sourceType,
+          filePath: uploadJob.nasFilePath,
+        };
+        const fileMeta = await getFileSourceMeta(fileSource);
         console.info(
-          `[audience-upload-worker] nas file ${uploadJob.nasFilePath}, content-length=${fileMeta.contentLength} (jobId=${jobId})`
+          `[audience-upload-worker] ${uploadJob.sourceType} file ${uploadJob.nasFilePath}, content-length=${fileMeta.contentLength} (jobId=${jobId})`
         );
 
-        // Sync hashes while streaming from NAS
-        // Prefer fileSize from PROPFIND (NAS browser) over Content-Length from HEAD
+        // Prefer the size recorded at job creation (PROPFIND for NAS, fs.stat
+        // for local) over Content-Length from HEAD.
         const totalBytes = uploadJob.fileSize ?? fileMeta.contentLength ?? 0;
 
-        const result = await syncLinesFromNas(
+        const result = await syncLinesFromSource(
           audienceId,
-          uploadJob.nasFilePath,
+          fileSource,
           totalBytes,
           resume,
           uploadJob.tokenId ?? undefined,
@@ -336,9 +342,9 @@ interface SyncProgress {
   lastSessionId: string | null;
 }
 
-async function syncLinesFromNas(
+async function syncLinesFromSource(
   audienceId: string,
-  nasFilePath: string,
+  fileSource: FileSourceRef,
   totalBytes: number,
   resume: { syncedLines: number; syncedHashCount: number; syncedByteOffset: number },
   tokenId: string | undefined,
@@ -380,8 +386,8 @@ async function syncLinesFromNas(
     }
   };
 
-  for await (const { hashes, bytesRead, endOffset } of streamNasFileLines(
-    nasFilePath,
+  for await (const { hashes, bytesRead, endOffset } of streamFileSourceLines(
+    fileSource,
     {
       knownSize: totalBytes > 0 ? totalBytes : null,
       startByte: startOffsetBytes > 0 ? startOffsetBytes : 0,

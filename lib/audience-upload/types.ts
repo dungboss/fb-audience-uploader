@@ -1,4 +1,10 @@
 export type AudienceUploadJobKind = "create" | "append";
+/**
+ * Where the source file lives. "nas" reads over WebDAV; "local" reads straight
+ * off the disk of the machine running the worker (only valid when the app, the
+ * worker and the user all sit on that same machine — see README).
+ */
+export type AudienceUploadSourceType = "nas" | "local";
 export type AudienceUploadJobStatus =
   | "draft"
   | "queued"
@@ -13,6 +19,11 @@ export interface AudienceUploadJob {
   status: AudienceUploadJobStatus;
   name: string;
   description: string;
+  // Source of the file. Jobs created before this field existed default to "nas".
+  sourceType: AudienceUploadSourceType;
+  // Path to the source file. For "nas" this is the absolute WebDAV path; for
+  // "local" it is only the FILE NAME, resolved against LOCAL_FILE_ROOT at read
+  // time so a stored job can never point outside the configured folder.
   nasFilePath: string;
   fileName: string;
   fileSize: number | null;

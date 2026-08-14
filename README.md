@@ -65,6 +65,40 @@ the target account. The picked account is remembered per browser and is
 snapshotted onto each upload job so the worker creates the audience under the
 right account. `FACEBOOK_AD_ACCOUNT_ID` is now only an optional default.
 
+## File sources: NAS or this machine's disk
+
+A job reads its data from one of two sources, snapshotted on the job as
+`sourceType`:
+
+- **NAS** (`nas`) — read over WebDAV from `WEBDAV_BASE_URL`. The job stores the
+  absolute NAS path.
+- **Local** (`local`) — read straight off the disk with `fs`, **no copying and
+  no uploading**. The job stores only the *file name*; it is resolved against
+  `LOCAL_FILE_ROOT` on every read, so a stored job can never point outside that
+  folder.
+
+To turn the local source on, set `LOCAL_FILE_ROOT` to one absolute folder and
+restart both the app and the worker. A **"Chọn file local"** button then appears
+next to "Duyệt NAS"; with the variable unset the button is hidden entirely.
+
+Deliberate limits:
+
+- **Same machine only.** The picker lists the filesystem of the machine running
+  the app, and the worker reads it from the machine running the worker. This
+  feature assumes the app, the worker and you are all on that one machine — the
+  local-only setup this project is built for. Behind a shared server it would
+  browse the *server's* disk, not the user's, so don't deploy it that way.
+- **Flat folder.** Only files directly inside `LOCAL_FILE_ROOT` are listed —
+  sub-folders, dotfiles and symlinks are ignored. Put the file in the folder.
+- **`.csv` / `.txt` only**, same as the NAS browser.
+- The file is `fs.stat`-ed when the job is created (fails fast, records the real
+  size) **and again in the worker**, since it can be moved or edited while the
+  job waits in the queue. A size change between the two makes the job fail
+  loudly rather than upload half-rewritten data.
+
+Resuming from an offset (below) works for both sources — and on local files it
+always works, since it never depends on HTTP Range support.
+
 ## Resuming a large upload from an offset
 
 Big files are uploaded in 10 MB ranges; the worker tracks how many bytes have

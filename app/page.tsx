@@ -6,6 +6,7 @@ import {
   AlertCircle,
   Download,
   FolderOpen,
+  HardDrive,
   KeyRound,
   Loader2,
   Plus,
@@ -51,6 +52,10 @@ import {
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { NasFileBrowserDialog } from "@/components/nas-file-browser-dialog";
+import {
+  LocalFileBrowserDialog,
+  fetchLocalFileListing,
+} from "@/components/local-file-browser-dialog";
 
 const numberFormatter = new Intl.NumberFormat("vi-VN");
 
@@ -114,7 +119,12 @@ type TokenListResponse = {
 // One option in the token picker. The empty-id entry represents the .env token.
 type TokenOption = { id: string; label: string };
 
+type FileSourceType = "nas" | "local";
+
+// A picked source file. For "nas" `nasFilePath` is the absolute WebDAV path;
+// for "local" it is just the file name inside LOCAL_FILE_ROOT.
 type NasFileSelection = {
+  sourceType: FileSourceType;
   fileName: string;
   nasFilePath: string;
   fileSize: number | null;
@@ -134,6 +144,7 @@ type AudienceUploadJob = {
   status: AudienceJobStatus;
   name: string;
   description: string;
+  sourceType: FileSourceType;
   nasFilePath: string;
   fileName: string;
   audienceId: string | null;
@@ -227,6 +238,9 @@ export default function Home() {
   );
   const [isNasBrowserOpen, setIsNasBrowserOpen] = useState(false);
   const [nasBrowserPath, setNasBrowserPath] = useState("/");
+  const [isLocalBrowserOpen, setIsLocalBrowserOpen] = useState(false);
+  // False hides the local-file button entirely (LOCAL_FILE_ROOT unset on server).
+  const [isLocalSourceEnabled, setIsLocalSourceEnabled] = useState(false);
 
   const [deleteTargets, setDeleteTargets] = useState<Audience[]>([]);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
@@ -301,6 +315,30 @@ export default function Home() {
   }
 
   // --- Bootstrap step 1: load access tokens, pick the active one ---
+  // Local-file source is opt-in via LOCAL_FILE_ROOT. Probe once on mount so the
+  // button stays hidden when the server has it unset.
+  useEffect(() => {
+    let isCancelled = false;
+
+    void (async () => {
+      try {
+        const listing = await fetchLocalFileListing();
+        if (!isCancelled) {
+          setIsLocalSourceEnabled(listing.configured);
+        }
+      } catch {
+        // Misconfigured root (unreadable folder) — treat as unavailable.
+        if (!isCancelled) {
+          setIsLocalSourceEnabled(false);
+        }
+      }
+    })();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     let isCancelled = false;
 
@@ -800,9 +838,37 @@ export default function Home() {
     setNasBrowseTarget(null);
   }
 
-  function handleNasFileSelected(selection: NasFileSelection) {
+  function openLocalBrowser(target: NasBrowseTarget) {
+    setNasBrowseTarget(target);
+    setIsLocalBrowserOpen(true);
+  }
+
+  function closeLocalBrowser() {
+    setIsLocalBrowserOpen(false);
+    setNasBrowseTarget(null);
+  }
+
+  // Local picks carry only the file name — the server resolves it against
+  // LOCAL_FILE_ROOT, so no absolute path ever travels through the browser.
+  function handleLocalFileSelected(selection: {
+    fileName: string;
+    fileSize: number | null;
+  }) {
+    handleFileSelected({
+      sourceType: "local",
+      fileName: selection.fileName,
+      nasFilePath: selection.fileName,
+      fileSize: selection.fileSize,
+    });
+  }
+
+  function handleNasFileSelected(selection: Omit<NasFileSelection, "sourceType">) {
+    handleFileSelected({ ...selection, sourceType: "nas" });
+  }
+
+  function handleFileSelected(selection: NasFileSelection) {
     if (!nasBrowseTarget) {
-      throw new Error("Chưa xác định nơi nhận file từ NAS.");
+      throw new Error("Chưa xác định nơi nhận file.");
     }
 
     if (nasBrowseTarget === "create") {
@@ -853,6 +919,7 @@ export default function Home() {
     try {
       const job = await createAudienceJob({
         kind: "create",
+        sourceType: createFile.sourceType,
         name: audienceName.trim(),
         description: description.trim(),
         nasFilePath: createFile.nasFilePath,
@@ -907,6 +974,7 @@ export default function Home() {
     try {
       const job = await createAudienceJob({
         kind: "append",
+        sourceType: updateFile.sourceType,
         audienceId: selectedAudience.id,
         nasFilePath: updateFile.nasFilePath,
         fileSize: updateFile.fileSize,
@@ -1189,6 +1257,7 @@ export default function Home() {
 
   async function createAudienceJob(input: {
     kind: AudienceJobKind;
+    sourceType: FileSourceType;
     name?: string;
     description?: string;
     audienceId?: string;
@@ -1233,6 +1302,15 @@ export default function Home() {
     return <Badge variant={info.variant}>{info.label}</Badge>;
   }
 
+  // NAS vs local source, shown next to the file name (no extra table column).
+  function FileSourceBadge({ sourceType }: { sourceType: FileSourceType }) {
+    return (
+      <Badge variant="outline" className="shrink-0">
+        {sourceType === "local" ? "Local" : "NAS"}
+      </Badge>
+    );
+  }
+
   function AvailabilityBadge({ availability }: { availability: AudienceAvailability }) {
     return (
       <Badge variant={availability === "ready" ? "default" : "secondary"}>
@@ -1263,27 +1341,46 @@ export default function Home() {
     title,
     selection,
     onBrowseNas,
+    onBrowseLocal,
   }: {
     disabled: boolean;
     title: string;
     selection: NasFileSelection | null;
     onBrowseNas: () => void;
+    onBrowseLocal: () => void;
   }) {
     return (
       <div className="space-y-3">
         <p className="text-sm font-medium">{title}</p>
-        <Button
-          type="button"
-          variant="outline"
-          disabled={disabled}
-          onClick={onBrowseNas}
-        >
-          <FolderOpen className="size-4" />
-          {selection ? "Đổi file khác" : "Duyệt NAS"}
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            disabled={disabled}
+            onClick={onBrowseNas}
+          >
+            <FolderOpen className="size-4" />
+            {selection ? "Đổi file khác" : "Duyệt NAS"}
+          </Button>
+          {/* Hidden entirely when LOCAL_FILE_ROOT is unset on the server. */}
+          {isLocalSourceEnabled ? (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={disabled}
+              onClick={onBrowseLocal}
+            >
+              <HardDrive className="size-4" />
+              Chọn file local
+            </Button>
+          ) : null}
+        </div>
         {selection ? (
           <div className="rounded-xl border bg-muted/20 p-3 text-sm">
-            <p className="font-medium truncate">{selection.fileName}</p>
+            <div className="flex items-center gap-2">
+              <FileSourceBadge sourceType={selection.sourceType} />
+              <p className="font-medium truncate">{selection.fileName}</p>
+            </div>
             <p className="mt-1 text-xs text-muted-foreground truncate">{selection.nasFilePath}</p>
             {selection.fileSize ? (
               <p className="mt-1 text-xs text-muted-foreground">{formatFileSize(selection.fileSize)}</p>
@@ -1436,9 +1533,12 @@ export default function Home() {
                                 <p className="truncate text-sm font-medium" title={job.name || job.fileName}>
                                   {job.name || job.fileName}
                                 </p>
-                                <p className="truncate text-xs text-muted-foreground" title={job.nasFilePath}>
-                                  {job.fileName}
-                                </p>
+                                <div className="flex items-center gap-1.5">
+                                  <FileSourceBadge sourceType={job.sourceType} />
+                                  <p className="truncate text-xs text-muted-foreground" title={job.nasFilePath}>
+                                    {job.fileName}
+                                  </p>
+                                </div>
                                 {job.syncedByteOffset > 0 ? (
                                   <p className="text-xs font-medium text-emerald-700">
                                     Đã up: {formatMb(job.syncedByteOffset)}
@@ -1886,6 +1986,7 @@ export default function Home() {
               title="Chọn file dữ liệu CSV/TXT từ NAS"
               selection={createFile}
               onBrowseNas={() => openNasBrowser("create")}
+              onBrowseLocal={() => openLocalBrowser("create")}
             />
             <div className="space-y-2">
               <label className="text-sm font-medium">
@@ -1976,6 +2077,7 @@ export default function Home() {
               title="Chọn file CSV/TXT từ NAS"
               selection={updateFile}
               onBrowseNas={() => openNasBrowser("update")}
+              onBrowseLocal={() => openLocalBrowser("update")}
             />
 
             <ProgressPanel progress={updateProgress} />
@@ -2147,6 +2249,12 @@ export default function Home() {
         }}
         onSelectFile={handleNasFileSelected}
         rootLabel="NAS"
+      />
+
+      <LocalFileBrowserDialog
+        isOpen={isLocalBrowserOpen}
+        onClose={closeLocalBrowser}
+        onSelectFile={handleLocalFileSelected}
       />
 
       <AlertDialog

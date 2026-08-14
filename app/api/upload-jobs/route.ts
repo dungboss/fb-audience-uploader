@@ -38,6 +38,7 @@ export async function POST(request: Request) {
   try {
     const body = (await request.json()) as {
       kind?: unknown;
+      sourceType?: unknown;
       name?: unknown;
       description?: unknown;
       nasFilePath?: unknown;
@@ -58,6 +59,7 @@ export async function POST(request: Request) {
 
     const job = await createAudienceUploadJob({
       kind: body.kind === "append" ? "append" : "create",
+      sourceType: body.sourceType === "local" ? "local" : "nas",
       name: typeof body.name === "string" ? body.name : undefined,
       description:
         typeof body.description === "string" ? body.description : undefined,
