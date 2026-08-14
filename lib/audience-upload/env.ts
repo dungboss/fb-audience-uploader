@@ -18,6 +18,9 @@ export interface AudienceUploadConfig {
   presignedUrlTtlSeconds: number;
   jobAttempts: number;
   workerConcurrency: number;
+  // Jobs allowed to run at once against the SAME ad account (act_id). Meta rate
+  // limits are per ad account, so raising this trades safety margin for speed.
+  maxJobsPerAdAccount: number;
   workerRateLimitMax: number;
   workerRateLimitDurationMs: number;
   metaRequestIntervalMs: number;
@@ -83,6 +86,8 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
     // most one job per ad account (act_id), so effective parallelism =
     // min(this, #ad accounts with pending jobs). Bump if you upload to more.
     workerConcurrency: readNumberEnv("UPLOAD_WORKER_CONCURRENCY", 4),
+    // Default 1 keeps the historical "one job per ad account" behaviour.
+    maxJobsPerAdAccount: readNumberEnv("UPLOAD_MAX_JOBS_PER_AD_ACCOUNT", 1),
     workerRateLimitMax: readNumberEnv("UPLOAD_WORKER_RATE_LIMIT_MAX", 1),
     workerRateLimitDurationMs: readNumberEnv(
       "UPLOAD_WORKER_RATE_LIMIT_DURATION_MS",

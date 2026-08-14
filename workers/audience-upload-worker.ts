@@ -28,19 +28,45 @@ import {
 } from "../lib/resilient-fetch";
 import type { AudienceUploadJobPayload } from "../lib/audience-upload/types";
 
-const DEFAULT_RETRY_DELAY_MS = 5_000;
+// Every failure except Meta's own rate limiting waits this long, then the job
+// resumes from its confirmed byte offset. Deliberately flat (no exponential
+// backoff): these are transient hiccups — gateway 5xx, non-JSON bodies, dropped
+// sockets, a stalled lock — and a fixed short wait gets the job moving again.
+const DEFAULT_RETRY_DELAY_MS = 60_000;
 // Per-ad-account Meta request throttle: one self-expiring key per ad account so
 // different accounts pace independently (and can upload in parallel).
 const META_REQUEST_THROTTLE_PREFIX = "audience-upload:meta-request-throttle";
 // A job whose ad account is already busy is deferred by this long, then retried.
 const ACCOUNT_BUSY_RETRY_DELAY_MS = 10_000;
 
-// Ad-account keys currently being processed by THIS worker process. Enforces "at
-// most one job per ad account (act_id) at a time" while letting different
-// accounts run concurrently. In-memory is sufficient because a single Worker
-// runs all concurrent handlers in one process; BullMQ already prevents two
-// workers from taking the same job.
-const activeAccountKeys = new Set<string>();
+// How many jobs each ad account (act_id) is currently running in THIS worker
+// process. Enforces "at most maxJobsPerAdAccount jobs per ad account at a time"
+// while letting different accounts run concurrently. In-memory is sufficient
+// because a single Worker runs all concurrent handlers in one process; BullMQ
+// already prevents two workers from taking the same job. Running more than one
+// worker process breaks this guarantee — see README.
+const activeAccountJobCounts = new Map<string, number>();
+
+function tryAcquireAccountSlot(accountKey: string, maxPerAccount: number) {
+  const current = activeAccountJobCounts.get(accountKey) ?? 0;
+
+  if (current >= maxPerAccount) {
+    return false;
+  }
+
+  activeAccountJobCounts.set(accountKey, current + 1);
+  return true;
+}
+
+function releaseAccountSlot(accountKey: string) {
+  const next = (activeAccountJobCounts.get(accountKey) ?? 1) - 1;
+
+  if (next > 0) {
+    activeAccountJobCounts.set(accountKey, next);
+  } else {
+    activeAccountJobCounts.delete(accountKey);
+  }
+}
 
 // Resolves the concurrency/throttle bucket for a job: its ad account id, else
 // the token id, else a shared default bucket.
@@ -85,16 +111,16 @@ async function main() {
         };
       }
 
-      // Per-ad-account concurrency gate: at most one job per ad account (act_id)
-      // processes at a time; a same-account job is deferred (no attempt consumed)
-      // so the worker can run other accounts' jobs meanwhile.
+      // Per-ad-account concurrency gate: at most `maxJobsPerAdAccount` jobs per
+      // ad account (act_id) at a time; a job over that limit is deferred (no
+      // attempt consumed) so the worker can run other accounts' jobs meanwhile.
       const accountKey = resolveAccountKey(
         uploadJob.adAccountId,
         uploadJob.tokenId
       );
-      if (activeAccountKeys.has(accountKey)) {
+      if (!tryAcquireAccountSlot(accountKey, config.maxJobsPerAdAccount)) {
         console.info(
-          `[audience-upload-worker] job ${jobId} deferred: ${accountKey} busy`
+          `[audience-upload-worker] job ${jobId} deferred: ${accountKey} at limit (${config.maxJobsPerAdAccount})`
         );
         await bullJob.moveToDelayed(
           Date.now() + ACCOUNT_BUSY_RETRY_DELAY_MS,
@@ -102,7 +128,6 @@ async function main() {
         );
         throw new DelayedError();
       }
-      activeAccountKeys.add(accountKey);
 
       try {
       await patchAudienceUploadJob(jobId, {
@@ -239,26 +264,30 @@ async function main() {
           return { jobId, audienceId, cancelled: true };
         }
 
-        // Retryable: transient connection drop or Meta rate limit → let BullMQ retry.
-        if (isTransientFetchError(error) || isMetaRateLimitRetryError(error)) {
-          throw error;
-        }
-
-        // Genuine, non-recoverable error (bad token, deleted audience, invalid
-        // data...) → fail fast instead of looping all 168 attempts.
-        throw new UnrecoverableError(
-          error instanceof Error ? error.message : String(error)
-        );
+        // Policy: EVERY error is retryable. Meta rate limits get the long
+        // cooldown; everything else (gateway 5xx, non-JSON body, dropped
+        // socket, stalled lock, bad token...) waits DEFAULT_RETRY_DELAY_MS and
+        // resumes from the confirmed offset. Nothing is failed on the spot —
+        // a job only dies after exhausting its attempts.
+        throw error;
       }
       } finally {
-        // Release the app so another job for the same app_id can run. A job
-        // that threw for retry frees the app now and re-acquires on its retry.
-        activeAccountKeys.delete(accountKey);
+        // Free the slot so another job for the same ad account can run. A job
+        // that threw for retry releases now and re-acquires on its retry.
+        releaseAccountSlot(accountKey);
       }
     },
     {
       connection: getBullConnectionOptions(),
       concurrency: config.workerConcurrency,
+      // Hashing is synchronous and blocks the event loop, so lock renewals can
+      // arrive late under heavy concurrency. A longer lock plus a generous
+      // stall budget keeps a busy worker from being mistaken for a dead one —
+      // a stalled job is re-queued and resumes from its offset instead of dying
+      // ("job stalled more than allowable limit").
+      lockDuration: 120_000,
+      stalledInterval: 60_000,
+      maxStalledCount: 20,
       limiter: {
         max: config.workerRateLimitMax,
         duration: config.workerRateLimitDurationMs,
@@ -329,7 +358,7 @@ async function main() {
   });
 
   console.info(
-    `[audience-upload-worker] listening queue=${config.queueName} concurrency=${config.workerConcurrency}`
+    `[audience-upload-worker] listening queue=${config.queueName} concurrency=${config.workerConcurrency} maxPerAdAccount=${config.maxJobsPerAdAccount}`
   );
 }
 
@@ -557,10 +586,9 @@ function metaAwareRetryDelayMs(attemptsMade: number, error: unknown): number {
   if (isMetaRateLimitRetryError(error)) {
     return metaRateLimitDelayMs;
   }
-  return Math.min(
-    DEFAULT_RETRY_DELAY_MS * 2 ** Math.max(attemptsMade - 1, 0),
-    metaRateLimitDelayMs
-  );
+  // Flat delay for everything else — see DEFAULT_RETRY_DELAY_MS.
+  void attemptsMade;
+  return DEFAULT_RETRY_DELAY_MS;
 }
 
 function shouldRetryLater(
@@ -573,11 +601,10 @@ function shouldRetryLater(
   }
 
   const maxAttempts = bullJob.opts.attempts ?? 1;
-  // Re-queue both Meta rate limits and transient connection drops
-  // (undici "terminated", ECONNRESET, socket timeout) instead of failing hard.
-  const retryable =
-    isMetaRateLimitRetryError(error) || isTransientFetchError(error);
-  return retryable && bullJob.attemptsMade < maxAttempts;
+  // Every error type is re-queued now (Meta rate limits, transient connection
+  // drops, gateway/non-JSON responses, stalled locks, ...). A job only stops
+  // retrying once it runs out of attempts.
+  return bullJob.attemptsMade < maxAttempts;
 }
 
 function buildRetryMessage(error: Error) {
@@ -593,7 +620,8 @@ function buildRetryMessage(error: Error) {
     return `Ket noi bi gian doan (${describeFetchError(error)}). Worker se thu lai.`;
   }
 
-  return error.message;
+  const retryInSeconds = Math.round(DEFAULT_RETRY_DELAY_MS / 1000);
+  return `${error.message} Worker se cho ${retryInSeconds}s roi up tiep tu offset da luu.`;
 }
 
 function waitFor(delayMs: number) {

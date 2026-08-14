@@ -99,6 +99,29 @@ Deliberate limits:
 Resuming from an offset (below) works for both sources — and on local files it
 always works, since it never depends on HTTP Range support.
 
+## Upload concurrency
+
+Two limits stack, and the effective parallelism is the smaller of them:
+
+- `UPLOAD_WORKER_CONCURRENCY` — jobs in flight across all ad accounts.
+- `UPLOAD_MAX_JOBS_PER_AD_ACCOUNT` — jobs against the *same* `act_id`. Meta rate
+  limits are per ad account, so this is the knob that decides how hard a single
+  account is pushed. Default 1; a job over the limit is deferred 10s **without
+  consuming a retry attempt**.
+
+```
+parallel jobs = min(UPLOAD_WORKER_CONCURRENCY,
+                    #ad accounts with pending jobs × UPLOAD_MAX_JOBS_PER_AD_ACCOUNT)
+```
+
+Inside one job, requests to Meta are strictly sequential — one in flight at a
+time — so an ad account sees at most `UPLOAD_MAX_JOBS_PER_AD_ACCOUNT` concurrent
+requests.
+
+> **Run exactly one worker process.** The per-account limit is coordinated in
+> memory. Two `npm run worker:audiences` processes cannot see each other's
+> counters, so the same ad account would silently run double the intended jobs.
+
 ## Resuming a large upload from an offset
 
 Big files are uploaded in 10 MB ranges; the worker tracks how many bytes have
