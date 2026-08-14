@@ -851,13 +851,16 @@ export default function Home() {
   // Local picks carry only the file name — the server resolves it against
   // LOCAL_FILE_ROOT, so no absolute path ever travels through the browser.
   function handleLocalFileSelected(selection: {
+    filePath: string;
     fileName: string;
     fileSize: number | null;
   }) {
     handleFileSelected({
       sourceType: "local",
+      // Display uses the base name; the job stores the path relative to
+      // LOCAL_FILE_ROOT so files in sub-folders work too.
       fileName: selection.fileName,
-      nasFilePath: selection.fileName,
+      nasFilePath: selection.filePath,
       fileSize: selection.fileSize,
     });
   }

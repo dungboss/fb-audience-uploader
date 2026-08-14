@@ -26,13 +26,19 @@ import { cn } from "@/lib/utils";
 import { formatWebDavDate, formatWebDavSize } from "@/lib/webdav";
 
 /**
- * Picker for files sitting directly in LOCAL_FILE_ROOT on the machine that runs
- * the app + worker. Deliberately flat: no folder tree, no navigation — the
- * configured root is the whole world, so a plain list is the whole UI.
+ * Picker for files under LOCAL_FILE_ROOT on the machine that runs the app +
+ * worker. Sub-folders are walked and flattened into one list (each row shows
+ * its folder) rather than given a navigable tree: the configured root is the
+ * whole world, so a searchable flat list is enough.
  */
 
 export type LocalFileEntry = {
+  /** Path relative to LOCAL_FILE_ROOT — what a job stores ("1/roth.txt"). */
+  path: string;
+  /** Base name, shown to the user and used for the audience name. */
   name: string;
+  /** Containing folder relative to the root, "" when directly in the root. */
+  folder: string;
   size: number | null;
   lastModified: string | null;
 };
@@ -44,6 +50,9 @@ export type LocalFileListing = {
 };
 
 type LocalFileSelection = {
+  /** Relative path, stored on the job. */
+  filePath: string;
+  /** Base name, for display and the audience name. */
   fileName: string;
   fileSize: number | null;
 };
@@ -78,12 +87,15 @@ export function LocalFileBrowserDialog({
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  // null = show every folder.
+  const [folderFilter, setFolderFilter] = useState<string | null>(null);
 
   const loadListing = useCallback(async (resetFilters = false) => {
     if (resetFilters) {
       setSearchQuery("");
-      setSelectedFileName(null);
+      setSelectedFilePath(null);
+      setFolderFilter(null);
     }
 
     setIsLoading(true);
@@ -114,22 +126,27 @@ export function LocalFileBrowserDialog({
     });
   }, [isOpen, loadListing]);
 
+  const folders = useMemo(
+    () => [...new Set((listing?.files ?? []).map((file) => file.folder))].sort(),
+    [listing]
+  );
+
   const visibleFiles = useMemo(() => {
     const files = listing?.files ?? [];
     const normalizedQuery = searchQuery.trim().toLowerCase();
 
-    if (!normalizedQuery) {
-      return files;
-    }
-
-    return files.filter((file) =>
-      file.name.toLowerCase().includes(normalizedQuery)
-    );
-  }, [listing, searchQuery]);
+    return files.filter((file) => {
+      if (folderFilter !== null && file.folder !== folderFilter) {
+        return false;
+      }
+      // Search matches the folder too, so "1/" narrows to that sub-folder.
+      return !normalizedQuery || file.path.toLowerCase().includes(normalizedQuery);
+    });
+  }, [listing, searchQuery, folderFilter]);
 
   const selectedFile = useMemo(
-    () => listing?.files.find((file) => file.name === selectedFileName) ?? null,
-    [listing, selectedFileName]
+    () => listing?.files.find((file) => file.path === selectedFilePath) ?? null,
+    [listing, selectedFilePath]
   );
 
   function handleConfirmSelection() {
@@ -137,7 +154,11 @@ export function LocalFileBrowserDialog({
       return;
     }
 
-    onSelectFile({ fileName: selectedFile.name, fileSize: selectedFile.size });
+    onSelectFile({
+      filePath: selectedFile.path,
+      fileName: selectedFile.name,
+      fileSize: selectedFile.size,
+    });
     onClose();
   }
 
@@ -156,7 +177,7 @@ export function LocalFileBrowserDialog({
             <DialogHeader className="pr-0">
               <DialogTitle>Chọn file từ máy này</DialogTitle>
               <DialogDescription>
-                Chỉ hiện file .csv/.txt nằm trực tiếp trong thư mục đã cấu hình.
+                File .csv/.txt trong thư mục đã cấu hình, kể cả thư mục con.
                 Bỏ file vào đó rồi bấm Làm mới.
               </DialogDescription>
             </DialogHeader>
@@ -169,6 +190,37 @@ export function LocalFileBrowserDialog({
                 {`${listing?.files.length ?? 0} file`}
               </Badge>
             </div>
+
+            {folders.length > 1 ? (
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {[null, ...folders].map((folder) => {
+                  const count =
+                    folder === null
+                      ? listing?.files.length ?? 0
+                      : (listing?.files ?? []).filter((f) => f.folder === folder).length;
+                  const label =
+                    folder === null ? "Tất cả" : folder || "Thư mục gốc";
+                  return (
+                    <button
+                      key={folder ?? "(all)"}
+                      type="button"
+                      onClick={() => {
+                        setFolderFilter(folder);
+                        setSelectedFilePath(null);
+                      }}
+                      className={cn(
+                        "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                        folderFilter === folder
+                          ? "border-sky-200 bg-sky-50 text-sky-800"
+                          : "border-border bg-background text-muted-foreground hover:border-sky-200 hover:text-foreground"
+                      )}
+                    >
+                      {label} ({count})
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
           </div>
 
           <div className="flex flex-col gap-3 border-b border-border/70 px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
@@ -241,25 +293,32 @@ export function LocalFileBrowserDialog({
                     </TableRow>
                   ) : (
                     visibleFiles.map((file) => {
-                      const isSelected = selectedFileName === file.name;
+                      const isSelected = selectedFilePath === file.path;
 
                       return (
                         <TableRow
-                          key={file.name}
+                          key={file.path}
                           data-state={isSelected ? "selected" : undefined}
                           className={cn(
                             "cursor-pointer transition-colors hover:bg-sky-50/40",
                             isSelected && "bg-sky-50/70"
                           )}
-                          onClick={() => setSelectedFileName(file.name)}
+                          onClick={() => setSelectedFilePath(file.path)}
                         >
                           <TableCell className="align-top">
                             <span className="flex min-w-0 items-center gap-3">
                               <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-emerald-100 text-emerald-600">
                                 <FileText className="size-4" />
                               </span>
-                              <span className="min-w-0 truncate font-medium text-slate-900">
-                                {file.name}
+                              <span className="min-w-0 truncate">
+                                <span className="block truncate font-medium text-slate-900">
+                                  {file.name}
+                                </span>
+                                {file.folder ? (
+                                  <span className="block truncate text-xs text-muted-foreground">
+                                    {file.folder}/
+                                  </span>
+                                ) : null}
                               </span>
                             </span>
                           </TableCell>

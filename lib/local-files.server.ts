@@ -13,7 +13,16 @@ import { isSupportedWebDavUploadFile } from "@/lib/webdav";
  */
 
 export type LocalFileEntry = {
+  /**
+   * Path relative to LOCAL_FILE_ROOT, POSIX-style ("roth.txt", "1/roth.txt").
+   * This is what a job stores. A bare file name is just a relative path with no
+   * directory, so jobs created before sub-folders were supported still resolve.
+   */
+  path: string;
+  /** Base name, for display and for deriving the audience name. */
   name: string;
+  /** Containing folder relative to the root, "" when directly in the root. */
+  folder: string;
   size: number | null;
   lastModified: string | null;
 };
@@ -51,24 +60,30 @@ export async function getLocalFileRoot(): Promise<string | null> {
 }
 
 /**
- * Rejects anything that is not a bare file name (no separators, no "..", no
- * dotfiles) and with an unsupported extension. Cheap, no I/O — safe to call
- * from job creation as well as from the worker.
+ * Accepts a path RELATIVE to the root, with or without sub-folders
+ * ("roth.txt", "1/roth.txt"). Rejects absolute paths, any ".." segment, and
+ * dot-prefixed segments. Cheap, no I/O — safe to call from job creation as well
+ * as from the worker.
  */
 export function assertValidLocalFileName(fileName: string): string {
-  const trimmed = fileName.trim();
+  const trimmed = fileName.trim().replaceAll("\\", "/");
 
-  if (
-    !trimmed ||
-    trimmed.startsWith(".") ||
-    trimmed.includes("/") ||
-    trimmed.includes("\\") ||
-    trimmed !== path.basename(trimmed)
-  ) {
-    throw new LocalFileError(`Tên file local không hợp lệ: ${fileName}`);
+  if (!trimmed || trimmed.startsWith("/") || path.isAbsolute(trimmed)) {
+    throw new LocalFileError(`Đường dẫn file local không hợp lệ: ${fileName}`);
   }
 
-  if (!isSupportedWebDavUploadFile({ name: trimmed, mimeType: null, isDirectory: false })) {
+  const segments = trimmed.split("/");
+
+  if (
+    segments.length === 0 ||
+    segments.some((segment) => !segment || segment === "." || segment === ".." || segment.startsWith("."))
+  ) {
+    throw new LocalFileError(`Đường dẫn file local không hợp lệ: ${fileName}`);
+  }
+
+  const baseName = segments.at(-1)!;
+
+  if (!isSupportedWebDavUploadFile({ name: baseName, mimeType: null, isDirectory: false })) {
     throw new LocalFileError("Chỉ hỗ trợ file .csv hoặc .txt.");
   }
 
@@ -97,7 +112,8 @@ export async function resolveLocalFilePath(fileName: string): Promise<string> {
     throw new LocalFileError(`Không tìm thấy file local: ${safeName}`);
   }
 
-  if (realFilePath !== path.join(root, path.basename(realFilePath))) {
+  // Must still sit inside the root after symlinks are resolved.
+  if (realFilePath !== root && !realFilePath.startsWith(root + path.sep)) {
     throw new LocalFileError(`File local nằm ngoài thư mục cho phép: ${safeName}`);
   }
 
@@ -116,7 +132,11 @@ export async function statLocalFile(fileName: string): Promise<number> {
   return stats.size;
 }
 
-/** Flat listing of supported files directly inside the root. */
+// How deep below the root the listing walks. Guards against a pathological
+// tree (or a symlink loop) turning the picker into a full-disk scan.
+const MAX_LISTING_DEPTH = 5;
+
+/** Supported files inside the root, including sub-folders. */
 export async function listLocalFiles(): Promise<LocalFileListing> {
   const root = await getLocalFileRoot();
 
@@ -124,14 +144,44 @@ export async function listLocalFiles(): Promise<LocalFileListing> {
     return { configured: false, root: null, files: [] };
   }
 
-  const dirEntries = await readdir(root, { withFileTypes: true });
   const files: LocalFileEntry[] = [];
+  await collectFiles(root, "", 0, files);
+
+  // Root files first, then by folder, then by name.
+  files.sort(
+    (left, right) =>
+      left.folder.localeCompare(right.folder) || left.name.localeCompare(right.name)
+  );
+
+  return { configured: true, root, files };
+}
+
+async function collectFiles(
+  absoluteDir: string,
+  relativeDir: string,
+  depth: number,
+  out: LocalFileEntry[]
+): Promise<void> {
+  const dirEntries = await readdir(absoluteDir, { withFileTypes: true });
 
   for (const entry of dirEntries) {
-    // Sub-directories are hidden on purpose (flat root only), as are dotfiles.
-    // isFile() is also false for symlinks, so links out of the root never even
-    // show up — matching what resolveLocalFilePath() would reject anyway.
-    if (!entry.isFile() || entry.name.startsWith(".")) {
+    // Dot-prefixed entries stay hidden. isFile()/isDirectory() are both false
+    // for symlinks, so links out of the root never show up — matching what
+    // resolveLocalFilePath() would reject anyway.
+    if (entry.name.startsWith(".")) {
+      continue;
+    }
+
+    const relativePath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+
+    if (entry.isDirectory()) {
+      if (depth < MAX_LISTING_DEPTH) {
+        await collectFiles(path.join(absoluteDir, entry.name), relativePath, depth + 1, out);
+      }
+      continue;
+    }
+
+    if (!entry.isFile()) {
       continue;
     }
 
@@ -140,9 +190,11 @@ export async function listLocalFiles(): Promise<LocalFileListing> {
     }
 
     try {
-      const stats = await stat(path.join(root, entry.name));
-      files.push({
+      const stats = await stat(path.join(absoluteDir, entry.name));
+      out.push({
+        path: relativePath,
         name: entry.name,
+        folder: relativeDir,
         size: stats.size,
         lastModified: stats.mtime.toISOString(),
       });
@@ -150,8 +202,4 @@ export async function listLocalFiles(): Promise<LocalFileListing> {
       // Unreadable entry (permissions, race with a delete) — just skip it.
     }
   }
-
-  files.sort((left, right) => left.name.localeCompare(right.name));
-
-  return { configured: true, root, files };
 }
