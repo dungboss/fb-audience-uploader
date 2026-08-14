@@ -15,7 +15,12 @@ import type {
 const JOB_KEY_PREFIX = "audience-upload:job:";
 const JOB_INDEX_KEY = "audience-upload:job-index";
 const RECENT_JOBS_KEY = "audience-upload:recent-jobs";
-const MAX_RECENT_JOBS = 20;
+// Ceiling on the recent-jobs index the dashboard reads. Sized for bulk
+// creation: making 20 jobs at once used to push every in-flight job out of a
+// 20-slot list, so running uploads vanished from the UI while still running.
+// Entries whose job hash has expired (UPLOAD_JOB_TTL_SECONDS) are skipped when
+// listing, so an oversized index costs nothing but a few Redis reads.
+const MAX_RECENT_JOBS = 200;
 
 export async function createAudienceUploadJob(input: {
   kind: AudienceUploadJobKind;
