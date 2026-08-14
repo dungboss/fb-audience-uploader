@@ -90,17 +90,29 @@ function decryptSecret(payload: string): string {
   }
 
   const key = getEncryptionKey();
-  const decipher = createDecipheriv(
-    ALGORITHM,
-    key,
-    Buffer.from(ivB64, "base64")
-  );
-  decipher.setAuthTag(Buffer.from(tagB64, "base64"));
 
-  return Buffer.concat([
-    decipher.update(Buffer.from(dataB64, "base64")),
-    decipher.final(),
-  ]).toString("utf8");
+  try {
+    const decipher = createDecipheriv(
+      ALGORITHM,
+      key,
+      Buffer.from(ivB64, "base64")
+    );
+    decipher.setAuthTag(Buffer.from(tagB64, "base64"));
+
+    return Buffer.concat([
+      decipher.update(Buffer.from(dataB64, "base64")),
+      decipher.final(),
+    ]).toString("utf8");
+  } catch {
+    // GCM auth failure means the current TOKEN_ENCRYPTION_KEY is not the one
+    // this secret was encrypted with. Unrecoverable by design — say so instead
+    // of leaking Node's opaque "unable to authenticate data".
+    throw new FacebookApiError(
+      "Token này được mã hóa bằng TOKEN_ENCRYPTION_KEY khác nên không giải mã được. " +
+        "Hãy xóa token trong dashboard rồi thêm lại.",
+      400
+    );
+  }
 }
 
 export async function addFbToken(input: {
