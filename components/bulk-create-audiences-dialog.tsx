@@ -70,7 +70,13 @@ export function BulkCreateAudiencesDialog({
       setAccounts(accountsResponse.adAccounts);
       // Everything is selected by default — deselecting is the exception.
       setSelectedFiles(new Set(listing.files.map((file) => file.path)));
-      setSelectedAccounts(new Set(accountsResponse.adAccounts.map((a) => a.id)));
+      // Accounts Meta has disabled start unticked — uploading to them just
+      // burns a job — but they stay listed so the user can see why.
+      setSelectedAccounts(
+        new Set(
+          accountsResponse.adAccounts.filter((a) => a.isUsable).map((a) => a.id)
+        )
+      );
       setWarnings(
         accountsResponse.tokenErrors.map(
           (e) => `${e.tokenLabel}: ${e.message}`
@@ -283,7 +289,11 @@ export function BulkCreateAudiencesDialog({
               <SectionHeader
                 title="Ad account"
                 count={`${chosenAccounts.length}/${accounts.length}`}
-                onAll={() => setSelectedAccounts(new Set(accounts.map((a) => a.id)))}
+                onAll={() =>
+                  setSelectedAccounts(
+                    new Set(accounts.filter((a) => a.isUsable).map((a) => a.id))
+                  )
+                }
                 onNone={() => setSelectedAccounts(new Set())}
                 disabled={isLoading || isSubmitting}
               />
@@ -302,10 +312,17 @@ export function BulkCreateAudiencesDialog({
                         disabled={isSubmitting}
                         onToggle={() => setSelectedAccounts((s) => toggle(s, account.id))}
                         title={account.name}
-                        subtitle={account.tokenLabel}
+                        subtitle={
+                          account.statusLabel
+                            ? `⚠ ${account.statusLabel}`
+                            : account.tokenLabel
+                        }
+                        wrapSubtitle={Boolean(account.statusLabel)}
                         trailing={
                           count > 0 ? (
                             <Badge variant="secondary">{count} job</Badge>
+                          ) : !account.isUsable ? (
+                            <Badge variant="destructive">Không dùng được</Badge>
                           ) : null
                         }
                       />
@@ -443,6 +460,7 @@ function Row({
   onToggle,
   title,
   subtitle,
+  wrapSubtitle = false,
   trailing,
 }: {
   checked: boolean;
@@ -450,6 +468,7 @@ function Row({
   onToggle: () => void;
   title: string;
   subtitle: string | null;
+  wrapSubtitle?: boolean;
   trailing?: React.ReactNode;
 }) {
   return (
@@ -458,7 +477,7 @@ function Row({
       onClick={onToggle}
       disabled={disabled}
       className={cn(
-        "flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-sky-50/50",
+        "flex w-full items-start gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-sky-50/50",
         checked && "bg-sky-50/40"
       )}
     >
@@ -466,7 +485,18 @@ function Row({
       <span className="min-w-0 flex-1">
         <span className="block truncate text-sm font-medium">{title}</span>
         {subtitle ? (
-          <span className="block truncate text-xs text-muted-foreground">{subtitle}</span>
+          // A disabled-account reason is longer than the row — wrap it instead
+          // of truncating, so the user can actually read why.
+          <span
+            className={cn(
+              "block text-xs",
+              wrapSubtitle
+                ? "leading-4 text-amber-700"
+                : "truncate text-muted-foreground"
+            )}
+          >
+            {subtitle}
+          </span>
         ) : null}
       </span>
       {trailing}

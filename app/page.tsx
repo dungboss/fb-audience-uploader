@@ -95,6 +95,10 @@ type AdAccount = {
   accountId: string;
   name: string;
   accountStatus: number | null;
+  // False when Meta refuses uploads (disabled, unsettled, closed...).
+  isUsable: boolean;
+  // Why it is unusable, null when the account is fine.
+  statusLabel: string | null;
   currency: string | null;
 };
 
@@ -269,6 +273,11 @@ export default function Home() {
 
   // Jobs whose terminal status we've already surfaced (avoid re-toasting on poll).
   const announcedDoneRef = useRef<Set<string>>(new Set());
+
+  // Warning text for the ad account currently picked in the header.
+  const selectedAdAccountStatusLabel =
+    adAccounts.find((account) => account.id === selectedAdAccountId)
+      ?.statusLabel ?? null;
 
   const selectedIdSet = new Set(selectedIds);
   const normalizedSearchQuery = deferredSearchQuery.trim().toLowerCase();
@@ -1490,7 +1499,10 @@ export default function Home() {
                     <option value="">Không có tài khoản khả dụng</option>
                   ) : (
                     adAccounts.map((account) => (
+                      // <option> can't wrap, so the status only gets a marker
+                      // here — the full reason renders on its own line below.
                       <option key={account.id} value={account.id}>
+                        {account.isUsable === false ? "⚠ " : ""}
                         {account.name} ({account.id})
                         {account.currency ? ` · ${account.currency}` : ""}
                       </option>
@@ -1503,6 +1515,13 @@ export default function Home() {
                   <Users className="pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2 text-muted-foreground" />
                 )}
               </div>
+              {/* Uploading to a disabled account just burns a job — say so
+                  before the user picks a file. */}
+              {selectedAdAccountStatusLabel ? (
+                <p className="max-w-72 text-xs leading-5 font-medium text-wrap text-amber-700">
+                  ⚠ {selectedAdAccountStatusLabel}
+                </p>
+              ) : null}
             </div>
 
             {/* Bulk creation spreads jobs over ALL ad accounts, so it sits next

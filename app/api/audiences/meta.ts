@@ -33,6 +33,12 @@ export interface AdAccountListItem {
   accountId: string; // numeric id without the act_ prefix
   name: string;
   accountStatus: number | null;
+  // Meta's disable_reason code; 0/null when the account was never disabled.
+  disableReason: number | null;
+  // False for anything Meta will refuse to serve — uploading to it wastes a job.
+  isUsable: boolean;
+  // Short Vietnamese explanation, null when the account is fine.
+  statusLabel: string | null;
   currency: string | null;
 }
 
@@ -75,6 +81,7 @@ interface MetaAdAccount {
   account_id?: string;
   name?: string;
   account_status?: number | string;
+  disable_reason?: number | string;
   currency?: string;
 }
 
@@ -187,7 +194,13 @@ export async function listAdAccounts(
   options?: FacebookCredentialOptions
 ): Promise<AdAccountListItem[]> {
   const credentials = await resolveCredentials(options);
-  const fields = ["account_id", "name", "account_status", "currency"].join(",");
+  const fields = [
+    "account_id",
+    "name",
+    "account_status",
+    "disable_reason",
+    "currency",
+  ].join(",");
 
   // First page goes through the shared helper (token + api version + parsing).
   let page = await facebookRequest<MetaAdAccountListResponse>(
@@ -547,13 +560,66 @@ function mapAdAccount(account: MetaAdAccount): AdAccountListItem | null {
     return null;
   }
 
+  const accountStatus = toNullableNumber(account.account_status);
+  const disableReason = toNullableNumber(account.disable_reason);
+
   return {
     id: `act_${accountId}`,
     accountId,
     name: account.name?.trim() || `act_${accountId}`,
-    accountStatus: toNullableNumber(account.account_status),
+    accountStatus,
+    disableReason,
+    // Only ACTIVE accounts accept uploads; treat an unknown status as usable so
+    // a new Meta status code never silently hides a working account.
+    isUsable: accountStatus === null || accountStatus === AD_ACCOUNT_STATUS_ACTIVE,
+    statusLabel: describeAdAccountStatus(accountStatus, disableReason),
     currency: account.currency ?? null,
   };
+}
+
+const AD_ACCOUNT_STATUS_ACTIVE = 1;
+
+// Meta's account_status / disable_reason codes, in the words a user needs to
+// decide whether to bother uploading to this account.
+const AD_ACCOUNT_STATUS_LABELS: Record<number, string> = {
+  2: "Bị vô hiệu hoá",
+  3: "Nợ cước",
+  7: "Đang xét duyệt rủi ro",
+  8: "Chờ thanh toán",
+  9: "Trong thời gian gia hạn",
+  100: "Sắp bị đóng",
+  101: "Đã đóng",
+};
+
+const AD_ACCOUNT_DISABLE_REASONS: Record<number, string> = {
+  1: "vi phạm chính sách quảng cáo",
+  2: "đang rà soát sở hữu trí tuệ",
+  3: "rủi ro thanh toán",
+  5: "đang rà soát AFC",
+  6: "rà soát tính toàn vẹn doanh nghiệp",
+  7: "đóng vĩnh viễn",
+  9: "không sử dụng",
+  11: "vi phạm chính sách Business Manager",
+  12: "khai báo sai lệch",
+  15: "tài khoản bị chiếm quyền",
+};
+
+function describeAdAccountStatus(
+  accountStatus: number | null,
+  disableReason: number | null
+): string | null {
+  if (accountStatus === null || accountStatus === AD_ACCOUNT_STATUS_ACTIVE) {
+    return null;
+  }
+
+  const status =
+    AD_ACCOUNT_STATUS_LABELS[accountStatus] ?? `Trạng thái ${accountStatus}`;
+  const reason =
+    disableReason && disableReason !== 0
+      ? AD_ACCOUNT_DISABLE_REASONS[disableReason] ?? `lý do ${disableReason}`
+      : null;
+
+  return reason ? `${status} — ${reason}` : status;
 }
 
 async function facebookRequest<T>(

@@ -13,6 +13,10 @@ export type BulkAdAccount = {
   /** Token that can reach this account — a job must carry the matching one. */
   tokenId: string;
   tokenLabel: string;
+  /** False when Meta will refuse uploads (disabled, unsettled, closed...). */
+  isUsable: boolean;
+  /** Why it is unusable, e.g. "Bị vô hiệu hoá — vi phạm chính sách quảng cáo". */
+  statusLabel: string | null;
 };
 
 export type BulkAssignment = {
