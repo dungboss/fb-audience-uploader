@@ -1640,6 +1640,17 @@ export default function Home() {
                                 >
                                   {job.adAccountName || job.adAccountId || "—"}
                                 </div>
+                                {/* Account names repeat across tokens (two
+                                    "Miho 1"s), so the act_id is what actually
+                                    identifies the account. */}
+                                {job.adAccountId && job.adAccountName ? (
+                                  <div
+                                    className="truncate font-mono text-xs text-muted-foreground"
+                                    title={job.adAccountId}
+                                  >
+                                    {job.adAccountId}
+                                  </div>
+                                ) : null}
                                 <div
                                   className="truncate text-xs text-muted-foreground"
                                   title={job.appName || undefined}
