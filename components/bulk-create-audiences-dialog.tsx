@@ -166,8 +166,8 @@ export function BulkCreateAudiencesDialog({
             sourceType: "local",
             nasFilePath: file.path,
             fileSize: file.size,
-            // Audience name = de_first_ + file name without its extension.
-            name: `de_first_${file.name.replace(/\.[^/.]+$/, "")}`,
+            // Audience name = fr_first_ + file name without its extension.
+            name: `fr_first_${file.name.replace(/\.[^/.]+$/, "")}`,
             adAccountId: account.id,
             adAccountName: account.name,
             tokenId: account.tokenId,
