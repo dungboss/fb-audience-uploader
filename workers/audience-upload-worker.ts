@@ -13,6 +13,7 @@ import {
   markAudienceUploadJobFailed,
   patchAudienceUploadJob,
 } from "../lib/audience-upload/jobs";
+import { deleteLocalFileAfterUpload } from "../lib/audience-upload/local-file-cleanup";
 import {
   getBullConnectionOptions,
   getRedis,
@@ -244,6 +245,21 @@ async function main() {
         });
 
         uploadJob = await markAudienceUploadJobCompleted(jobId);
+
+        // Optional housekeeping: drop the local source file now that Meta has
+        // every hash. Guarded inside (local-only, and only when no other job
+        // still needs the file); never throws, so a cleanup problem can never
+        // turn a finished upload into a failed one.
+        const cleanup = await deleteLocalFileAfterUpload(uploadJob);
+        if (cleanup.deleted) {
+          console.info(
+            `[audience-upload-worker] job ${jobId} đã xoá file local (${cleanup.mode}): ${cleanup.path}`
+          );
+        } else if (cleanup.reason !== "LOCAL_DELETE_AFTER_UPLOAD=off") {
+          console.info(
+            `[audience-upload-worker] job ${jobId} giữ lại file local — ${cleanup.reason}`
+          );
+        }
 
         return {
           jobId,

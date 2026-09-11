@@ -358,6 +358,54 @@ function parseEnum<T extends string>(
   return fallback;
 }
 
+/**
+ * Every job hash currently in Redis, including ones that fell off the capped
+ * recent-jobs list. Used by the post-upload cleanup, which must be sure NO
+ * other job still needs a file before deleting it — a capped list could hide
+ * exactly the sibling job that makes deletion unsafe.
+ */
+export async function listAllAudienceUploadJobs() {
+  const redis = getRedis();
+  const jobKeys: string[] = [];
+
+  let cursor = "0";
+  do {
+    const [nextCursor, keys] = await redis.scan(
+      cursor,
+      "MATCH",
+      `${JOB_KEY_PREFIX}*`,
+      "COUNT",
+      500
+    );
+    cursor = nextCursor;
+    jobKeys.push(...keys);
+  } while (cursor !== "0");
+
+  if (jobKeys.length === 0) {
+    return [];
+  }
+
+  const pipeline = redis.pipeline();
+  for (const key of jobKeys) {
+    pipeline.hgetall(key);
+  }
+
+  const results = (await pipeline.exec()) as [
+    Error | null,
+    Record<string, string>
+  ][];
+
+  return results
+    .map(([error, payload], index) => {
+      if (error || !payload || Object.keys(payload).length === 0) {
+        return null;
+      }
+
+      return parseJobPayload(jobKeys[index].slice(JOB_KEY_PREFIX.length), payload);
+    })
+    .filter((job): job is AudienceUploadJob => job !== null);
+}
+
 async function pushToRecentJobs(jobId: string) {
   await getRedis().lpush(RECENT_JOBS_KEY, jobId);
   await getRedis().ltrim(RECENT_JOBS_KEY, 0, MAX_RECENT_JOBS - 1);

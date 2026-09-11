@@ -10,6 +10,13 @@ const DEFAULT_META_BATCH_SIZE = 10_000;
 // Throughput ceiling in hashes/second used to derive request spacing.
 const DEFAULT_META_MAX_HASHES_PER_SECOND = 10_000;
 
+/**
+ * What to do with a LOCAL source file once its upload finishes successfully.
+ * "off" keeps the file, "trash" moves it to the macOS Trash (recoverable via
+ * Finder's "Put Back"), "permanent" unlinks it for good.
+ */
+export type LocalCleanupMode = "off" | "trash" | "permanent";
+
 export interface AudienceUploadConfig {
   redisUrl: string;
   queueName: string;
@@ -35,6 +42,9 @@ export interface AudienceUploadConfig {
   // Absolute path of the single folder local files may be picked from. Unset =
   // the local-file feature is off (the UI hides the button entirely).
   localFileRoot?: string;
+  // Auto-cleanup of local source files after a successful upload. Never
+  // touches NAS files, and never a file another job still needs.
+  localDeleteAfterUpload: LocalCleanupMode;
 }
 
 let cachedConfig: AudienceUploadConfig | null = null;
@@ -104,9 +114,27 @@ export function getAudienceUploadConfig(): AudienceUploadConfig {
     webdavUsername: readOptionalEnv("WEBDAV_USERNAME"),
     webdavPassword: readOptionalEnv("WEBDAV_PASSWORD"),
     localFileRoot: readOptionalEnv("LOCAL_FILE_ROOT"),
+    localDeleteAfterUpload: readLocalCleanupMode(),
   };
 
   return cachedConfig;
+}
+
+function readLocalCleanupMode(): LocalCleanupMode {
+  const rawValue = readOptionalEnv("LOCAL_DELETE_AFTER_UPLOAD")?.toLowerCase();
+
+  if (!rawValue) {
+    return "off";
+  }
+
+  if (rawValue === "off" || rawValue === "trash" || rawValue === "permanent") {
+    return rawValue;
+  }
+
+  throw new FacebookApiError(
+    "Biến môi trường LOCAL_DELETE_AFTER_UPLOAD chỉ nhận: off, trash, permanent.",
+    500
+  );
 }
 
 function readRequiredEnv(variableName: string) {
